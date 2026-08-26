@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from numba import njit, prange
 import copy
+import warnings
 
 def dictionary_matching(signal, dictionary, params, mask, tmp_dict, tmp_psf, plot_signal=None, 
                         plot_landscape=None, complex_dict=True, compute_pd=True):
@@ -22,6 +23,43 @@ def dictionary_matching(signal, dictionary, params, mask, tmp_dict, tmp_psf, plo
                                  axis=-1)
         tmp_dict = np.reshape(tmp_dict, [tmp_dict.shape[0], int(np.prod(tmp_dict.shape[1:-1])), tmp_dict.shape[-1]])
         tmp_dict = tmp_dict.astype(np.complex64)
+
+        n_dict_features = tmp_dict.shape[-1]
+        n_signal_features = real_signal.shape[-1]
+        if n_signal_features != n_dict_features:
+            if n_signal_features > n_dict_features:
+                action = f"truncated to the first {n_dict_features} features"
+                accuracy_note = (
+                    "Truncation is physically valid only if both the signal and dictionary "
+                    "subspace bases share the same SVD ordering (e.g. the signal was "
+                    f"reconstructed with {n_signal_features} subspace components and "
+                    f"subspaceBasis stores only the leading {n_dict_features})."
+                )
+            else:
+                action = f"zero-padded from {n_signal_features} to {n_dict_features} features"
+                accuracy_note = (
+                    "Zero-padding is unlikely to produce physically accurate results. "
+                    "Ensure the signal and dictionary are in the same subspace."
+                )
+            warnings.warn(
+                f"Signal feature dimension ({n_signal_features}) does not match dictionary "
+                f"feature dimension ({n_dict_features}). The signal will be {action}. "
+                f"{accuracy_note} "
+                f"The root cause is typically that the reconstruction used a different number "
+                f"of subspace components than what is stored in subspaceBasis.",
+                stacklevel=3
+            )
+            if n_signal_features > n_dict_features:
+                real_signal = real_signal[:, :n_dict_features]
+                real_signal_test = real_signal_test[:, :n_dict_features]
+            else:
+                pad_width = n_dict_features - n_signal_features
+                real_signal = np.pad(real_signal, ((0, 0), (0, pad_width)))
+                real_signal_test = np.pad(real_signal_test, ((0, 0), (0, pad_width)))
+            # Re-normalise after reshaping the signal
+            l2_signal_adj = np.sqrt(np.sum(np.square(np.abs(real_signal)), axis=-1))
+            l2_signal_adj[l2_signal_adj == 0] = 1.0
+            real_signal = real_signal / l2_signal_adj[:, np.newaxis]
 
         # err = np.zeros((real_signal.shape[0], tmp_dict.shape[1]))
         # for i in range(len(fieldmap_dict)):
