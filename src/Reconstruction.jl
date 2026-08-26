@@ -107,7 +107,7 @@ function constructOperators(r::ReconParams{<:Union{KdataPreprocessed{T}, KdataRe
                 @debug("CasprOp on GPU")
                 cuWeightsMasked = CuArray(weightsMasked)
 
-                if r.reconParameters[:iterativeReconParams][:diffReconTFE]
+                if get(r.reconParameters[:iterativeReconParams], :diffReconTFE, false)
                     E = CuCompositeOp(LinearOperatorCollection.WeightingOp(cuWeightsMasked), 
                         CuCasprOpDiff(profiles, reconSize, numContr, num_chan, r.scanParameters[:FlipAngle], r.scanParameters[:TR]), isWeighting=true)
                 else
@@ -270,7 +270,15 @@ function iterativeRecon(r::ReconParams{KdataPreprocessed{T}, <:AbstractTrajector
         startVector = Vector{Complex{T}}(undef, 0)
     end
 
-    solver = createLinearSolver(params[:solver], Efull; reg=reg, regTrafo=regTrafos, params...)
+    # Extract only the parameters that RegularizedLeastSquares.ADMM solver accepts
+    solverParams = Dict{Symbol, Any}()
+    for key in keys(params)
+        if key in [:iterations, :iterationsCG, :vary_rho, :rho, :normalizeReg]
+            solverParams[key] = params[key]
+        end
+    end
+    
+    solver = createLinearSolver(params[:solver], Efull; reg=reg, regTrafo=regTrafos, solverParams...)
 
     if params[:verboseIteration]
         @warn("Verbose flag currently not supported.")

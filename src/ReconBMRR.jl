@@ -16,7 +16,6 @@ using StatsBase
 using HDF5
 using ProgressMeter
 using DataStructures
-using Plots
 using NaNStatistics
 using StaticArrays
 using NPZ
@@ -32,6 +31,7 @@ include("ReconParams.jl")
 include("Operators/SensitivityOp2.jl")
 include("Operators/FFTOp.jl")
 include("Operators/DiagOp.jl")
+include("Operators/CasprOp.jl")
 include("Operators/CasprSubspaceOp.jl")
 include("Operators/CompositeOp.jl")
 include("Regularization.jl")

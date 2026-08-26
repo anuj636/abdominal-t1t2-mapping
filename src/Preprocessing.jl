@@ -155,18 +155,50 @@ function softGatingWeights!(r::ReconParams{KdataPreprocessed{T}, <:Cartesian3D})
 end
 
 function subspaceBasis!(r::ReconParams{KdataPreprocessed{T}, <:Cartesian3D}) where T<:AbstractFloat    
-    prep_dict = h5open(r.reconParameters[:prepDictPath])
+    @info("Loading dictionary file...")
     num_components = r.reconParameters[:iterativeReconParams][:subspaceComponents]
+    
+    # Create cache directory if it doesn't exist
+    cacheDir = joinpath(dirname(r.reconParameters[:prepDictPath]), ".cache")
+    if !isdir(cacheDir)
+        mkpath(cacheDir)
+    end
+    
+    # Define cache file path
+    dictFileName = splitext(basename(r.reconParameters[:prepDictPath]))[1]
+    cacheFile = joinpath(cacheDir, "$(dictFileName)_svd_basis_$(num_components).jld2")
+    
+    # Check if SVD basis is already cached
+    if isfile(cacheFile)
+        @info("Loading cached SVD basis from $cacheFile...")
+        cached = load(cacheFile)
+        r.reconParameters[:subspaceBasis] = cached["basis"]
+        r.reconParameters[:subspaceWeights] = cached["weights"]
+        @info("Cached basis loaded successfully!")
+        return
+    end
+    
+    prep_dict = h5open(r.reconParameters[:prepDictPath])
+    @info("Dictionary loaded. Computing mask...")
     mask_b0 = abs.(HDF5.attrs(prep_dict)["B0s"]) .<= 200 
+    @info("Extracting dictionary array...")
     prep_dict = Array(prep_dict["dictionary"])
+    @info("Applying B0 mask and reshaping...")
     prep_dict = prep_dict[:, :, :, :, :, mask_b0] ## Mask B0 values, maybe not needed
     prep_dict = reshape(prep_dict, prod(size(prep_dict)[1:3]), :)
     prep_dict = prep_dict'
+    @info("Starting SVD computation (this may take 5-10 minutes)...")
     F = svd(prep_dict)
     basis = F.V[:,1:num_components]
+    weights = F.S[1:num_components]
     @show sum(F.S)
     r.reconParameters[:subspaceBasis] = basis
-    r.reconParameters[:subspaceWeights] = F.S[1:num_components]#weights
+    r.reconParameters[:subspaceWeights] = weights
+    
+    # Cache the result
+    @info("Caching SVD basis to $cacheFile...")
+    save(cacheFile, Dict("basis" => basis, "weights" => weights))
+    @info("Subspace basis computed and cached successfully!")
 end
 
 function computeDensityCompensation!(r::ReconParams{KdataPreprocessed{T}, <:AbstractTrajectory}) where T<:AbstractFloat    

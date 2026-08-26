@@ -16,7 +16,9 @@ function prox!(reg::L1RegularizationDyn, x::Union{AbstractArray{T}, AbstractArra
     else
       ε = eps(T)
       reconSize = reg.reconSize
-      weights = repeat(reg.weights, inner = Int(reg.numDyn/size(reg.weights,1)))
+      weights_base = vec(reg.weights)
+      reps = cld(reg.numDyn, length(weights_base))
+      weights = repeat(weights_base, reps)[1:reg.numDyn]
       @assert length(reconSize) == 3
       for dim in 1:3
         mask_dim_1 = zeros(Bool, (reconSize[1] - 1) * reconSize[2] * reconSize[3] * reg.numDyn)

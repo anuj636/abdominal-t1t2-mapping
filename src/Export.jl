@@ -3,10 +3,18 @@ export saveasImDataParams
 function get_file(r::ReconParams, path, name, tag)
     filename = r.filename
     fsplit = split(basename(filename), '_')
-    datestr = string(fsplit[2][5:8], fsplit[2][3:4], fsplit[2][1:2])
-    timestr = fsplit[3][1:end-1]
-    SeriesNumber = string(fsplit[4], '0', fsplit[5])
-    fileID = string(datestr, '_', timestr, '_', SeriesNumber)
+    # Standard Philips raw filename has at least 5 underscore-separated parts
+    # with fsplit[2] being an 8-digit date (DDMMYYYY) and fsplit[3] a time string.
+    # Fall back to a safe fileID for non-standard filenames (e.g. from mrtools).
+    if length(fsplit) >= 5 && length(fsplit[2]) >= 8 && length(fsplit[3]) >= 1
+        datestr = string(fsplit[2][5:8], fsplit[2][3:4], fsplit[2][1:2])
+        timestr = fsplit[3][1:end-1]
+        SeriesNumber = string(fsplit[4], '0', fsplit[5])
+        fileID = string(datestr, '_', timestr, '_', SeriesNumber)
+    else
+        # Use basename of filename as fileID for non-standard filenames
+        fileID = replace(basename(filename), r"[^\w]" => "_")
+    end
     if path == ""
         path = r.pathProc
     end

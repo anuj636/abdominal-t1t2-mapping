@@ -109,7 +109,8 @@ function setIterativeReconParams(solver::String="ADMM")
             :verboseIteration => false, 
             :subspaceRecon => false,
             :subspaceComponents => 5, 
-            :spatialDeltaB0 => false
+            :spatialDeltaB0 => false,
+            :diffReconTFE => false
         )
     end
 end
