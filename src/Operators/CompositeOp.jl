@@ -15,8 +15,8 @@ mutable struct CompositeOp{T,U,V} <: AbstractLinearOperator{T}
   args5 :: Bool
   use_prod5! :: Bool
   allocated5 :: Bool
-  Mv5 :: Vector{T}
-  Mtu5 :: Vector{T}
+  Mv :: Vector{T}
+  Mtu :: Vector{T}
   isWeighting :: Bool
   A::U
   B::V
@@ -59,7 +59,7 @@ function CompositeOp(A,B;isWeighting=false)
   return Op
 end
 
-LinearOperators.storage_type(op::CompositeOp) = typeof(op.Mv5)
+LinearOperators.storage_type(op::CompositeOp) = typeof(op.Mv)
 
 """
 ∘(A::T1, B::T2; isWeighting::Bool=false) where {T1<:AbstractLinearOperator, T2<:AbstractLinearOperator}
@@ -90,8 +90,8 @@ mutable struct CuCompositeOp{T,U,V,S} <: AbstractLinearOperator{T}
     args5 :: Bool
     use_prod5! :: Bool
     allocated5 :: Bool
-    Mv5 :: S
-    Mtu5 :: S
+    Mv :: S
+    Mtu :: S
     isWeighting :: Bool
     A::U
     B::V
@@ -102,7 +102,7 @@ function CuCompositeOp(A,B;isWeighting=false)
     nrow = A.nrow
     ncol = B.ncol
     S = promote_type(LinearOperators.storage_type(A), LinearOperators.storage_type(B))
-    Mv5, Mtu5 = S(undef, 0), S(undef, 0)
+    Mv, Mtu = S(undef, 0), S(undef, 0)
     # tmp_ = Vector{S}(undef, B.nrow)
     tmp_ = S(undef, B.nrow)
   
@@ -125,13 +125,13 @@ function CuCompositeOp(A,B;isWeighting=false)
                        (res,x) -> produ!(res,x,tmp_),
                        (res,y) -> tprodu!(res,y,tmp_),
                        (res,y) -> ctprodu!(res,y,tmp_), 
-                       0, 0, 0, false, false, false, Mv5, Mtu5,
+                       0, 0, 0, false, false, false, Mv, Mtu,
                        isWeighting, A, B, tmp_)
   
     return Op
 end
   
-LinearOperators.storage_type(op::CuCompositeOp) = typeof(op.Mv5)
+LinearOperators.storage_type(op::CuCompositeOp) = typeof(op.Mv)
 
 # function Base.:∘(A::T1, B::T2; isWeighting::Bool=false) where {T1<:AbstractLinearOperator, T2<:AbstractLinearOperator}
 #     return CuCompositeOp(A,B;isWeighting=isWeighting)

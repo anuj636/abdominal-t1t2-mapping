@@ -328,7 +328,14 @@ class ImDataParamsRelax():
             signal = self._get_default_signal(magnitude=(complex_signal != True), fat=fat)
 
         params = {}
-        params['duration'] = self.RelaxParams['TE_s'] * 1e3
+        te_s = self.RelaxParams.get('TE_s')
+        if te_s is None:
+            te_s = self.ImDataParams.get('TE_s')
+        if te_s is None:
+            raise KeyError('TE_s is required in RelaxParams or ImDataParams for dictionary matching')
+        te_s = np.asarray(te_s)
+        self.RelaxParams['TE_s'] = te_s
+        params['duration'] = te_s * 1e3
         if 'angle_deg' in self.RelaxParams:
             params['angle'] = self.RelaxParams['angle_deg']
         else:
@@ -568,11 +575,34 @@ class ImDataParamsRelax():
         self.RelaxParams['T1_ms'][mask] = self.RelaxParams['T1_ms_unmasked'][mask]
         self.RelaxParams['T2_ms'][mask] = self.RelaxParams['T2_ms_unmasked'][mask]
 
-    def export_Array2nii(self, arr, filename, affine=np.eye(4)):
+    def export_Array2nii(self, arr, filename, affine=None, voxel_size_mm=None):
+        arr = np.asarray(arr)
+
+        if voxel_size_mm is None:
+            voxel_size_mm = self.ImDataParams.get("voxelSize_mm", [1.0, 1.0, 1.0])
+
+        voxel = np.asarray(voxel_size_mm, dtype=np.float32).reshape(-1)
+        if voxel.size < 3 or (not np.all(np.isfinite(voxel[:3]))) or np.any(voxel[:3] <= 0):
+            voxel = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        else:
+            voxel = voxel[:3]
+
+        if affine is None:
+            affine = np.eye(4, dtype=np.float32)
+            affine[0, 0] = float(voxel[0])
+            affine[1, 1] = float(voxel[1])
+            affine[2, 2] = float(voxel[2])
+
         saveArr = nib.Nifti1Image(arr, affine=affine)
         header = saveArr.header
         header['scl_slope'] = 1
         header['scl_inter'] = 0
+        zooms = [float(voxel[0]), float(voxel[1]), float(voxel[2])]
+        if arr.ndim > 3:
+            zooms.extend([1.0] * (arr.ndim - 3))
+        header.set_zooms(tuple(zooms))
+        saveArr.set_qform(affine, code=1)
+        saveArr.set_sform(affine, code=1)
         saveArr.to_filename(filename)
 
 

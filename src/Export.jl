@@ -45,15 +45,56 @@ function saveasImDataParams(r::ReconParams{<:AbstractKdata, <:AbstractTrajectory
     end
 
     g = create_group(fid, "ImDataParams")
-    nEchoes = length(r.scanParameters[:TE]) #parse(Int, searchGoalCparams(r, "EX_ACQ_echoes"))
+    if haskey(r.scanParameters, :TE_s)
+        nEchoes = length(r.scanParameters[:TE_s])
+    elseif haskey(r.scanParameters, :TE)
+        nEchoes = length(r.scanParameters[:TE])
+    else
+        nEchoes = 1
+    end
+    nEchoes = max(1, Int(nEchoes))
     nInter = 1 #r.scanParameters[:numInterleaves] TODO
-    HDF5.attributes(g)["voxelSize_mm"] = vec(r.scanParameters[:FOV]' ./ [size(img,i) for i=1:3])
-    HDF5.attributes(g)["fieldStrength_T"] = r.scanParameters[:FieldStrength] #parse(Float32, searchGoalCparams(r, "VW_main_magnetic_field"))
-    HDF5.attributes(g)["centerFreq_Hz"] = r.scanParameters[:centerFreq_Hz] #parse(Float32, searchGoalCparams(r, "HW_resonance_freq"))
+    fov_vals = Float32.(vec(r.scanParameters[:FOV]))
+    if length(fov_vals) >= 3
+        fov3 = fov_vals[1:3]
+    else
+        # Keep metadata shape stable even when upstream FOV is malformed.
+        fov3 = Float32.([size(img,1), size(img,2), size(img,3)])
+    end
+    HDF5.attributes(g)["voxelSize_mm"] = fov3 ./ Float32.([size(img,1), size(img,2), size(img,3)])
+
+    if haskey(r.scanParameters, :FieldStrength)
+        HDF5.attributes(g)["fieldStrength_T"] = r.scanParameters[:FieldStrength]
+    else
+        @warn "Missing scanParameters[:FieldStrength]; exporting fallback 0.0T"
+        HDF5.attributes(g)["fieldStrength_T"] = 0.0f0
+    end
+
+    if haskey(r.scanParameters, :centerFreq_Hz)
+        HDF5.attributes(g)["centerFreq_Hz"] = r.scanParameters[:centerFreq_Hz]
+    else
+        @warn "Missing scanParameters[:centerFreq_Hz]; exporting fallback 0.0 Hz"
+        HDF5.attributes(g)["centerFreq_Hz"] = 0.0f0
+    end
+
     if haskey(r.reconParameters, :subspaceBasis)
         g["subspaceBasis", deflate=3] = r.reconParameters[:subspaceBasis]
     end
-    HDF5.attributes(g)["TE_s"] = r.scanParameters[:TE_s]
+
+    te_s_export = if haskey(r.scanParameters, :TE_s)
+        Float32.(vec(r.scanParameters[:TE_s]))
+    elseif haskey(r.scanParameters, :TE)
+        te = Float32.(vec(r.scanParameters[:TE]))
+        (length(te) > 0 && maximum(te) > 0.1f0) ? (te .* 1f-3) : te
+    else
+        Float32[]
+    end
+    if length(te_s_export) == 0
+        @warn "Missing scanParameters[:TE_s] and [:TE]; exporting synthetic TE_s for $(nEchoes) echo(es)."
+        te_s_export = Float32.(collect(1:nEchoes) .* 1f-3)
+    end
+    HDF5.attributes(g)["TE_s"] = te_s_export
+
     HDF5.attributes(g)["fileID"] = fileID  
 
     # Change dimension such that they match python toolbox
@@ -80,21 +121,48 @@ function saveasImDataParams(r::ReconParams{<:AbstractKdata, <:AbstractTrajectory
 end
 
 function process_motion_params!(r, fid)
+    g = create_group(fid, "MotionParams")
     if haskey(r.reconParameters, :motionStatesCenter)
-        g = create_group(fid, "MotionParams")
-        g["motionCurve", deflate=3] = r.reconParameters[:motionCurve] 
-        g["motionStates", deflate=3] = r.reconParameters[:motionStates] 
-        g["motionStatesCenter"] = r.reconParameters[:motionStatesCenter] 
+        g["motionCurve", deflate=3] = r.reconParameters[:motionCurve]
+        g["motionStates", deflate=3] = r.reconParameters[:motionStates]
+        g["motionStatesCenter"] = r.reconParameters[:motionStatesCenter]
         HDF5.attributes(g)["method"] = r.reconParameters[:motionMethod]
+        HDF5.attributes(g)["status"] = "populated"
+    else
+        # Keep schema stable across environments, even when motion gating is disabled.
+        g["motionCurve", deflate=3] = Float32[]
+        g["motionStates", deflate=3] = Int32[]
+        g["motionStatesCenter"] = Int32[]
+        HDF5.attributes(g)["method"] = "none"
+        HDF5.attributes(g)["status"] = "not_available"
     end
 end
 
 function process_relax_params!(r, fid)
-    if r.scanParameters[:isFINO]
-        g = create_group(fid, "RelaxParams")
-        HDF5.attributes(g)["TE_s"] = r.scanParameters[:FINO_TE_s]
-        HDF5.attributes(g)["delay_s"] = r.scanParameters[:FINO_delay_s]
-        HDF5.attributes(g)["angle_deg"] = r.scanParameters[:FINO_angle_deg]
-        HDF5.attributes(g)["startup_delay_s"] = r.scanParameters[:FINO_startup_delay_s]
+    g = create_group(fid, "RelaxParams")
+    if haskey(r.scanParameters, :isFINO) && r.scanParameters[:isFINO]
+        if haskey(r.scanParameters, :FINO_TE_s)
+            HDF5.attributes(g)["TE_s"] = r.scanParameters[:FINO_TE_s]
+        end
+        if haskey(r.scanParameters, :FINO_delay_s)
+            HDF5.attributes(g)["delay_s"] = r.scanParameters[:FINO_delay_s]
+        end
+        if haskey(r.scanParameters, :FINO_angle_deg)
+            HDF5.attributes(g)["angle_deg"] = r.scanParameters[:FINO_angle_deg]
+        end
+        if haskey(r.scanParameters, :FINO_startup_delay_s)
+            HDF5.attributes(g)["startup_delay_s"] = r.scanParameters[:FINO_startup_delay_s]
+        end
+        HDF5.attributes(g)["status"] = "populated"
+    else
+        if haskey(r.scanParameters, :TE_s)
+            HDF5.attributes(g)["TE_s"] = Float32.(vec(r.scanParameters[:TE_s]))
+        elseif haskey(r.scanParameters, :TE)
+            te = Float32.(vec(r.scanParameters[:TE]))
+            HDF5.attributes(g)["TE_s"] = (length(te) > 0 && maximum(te) > 0.1f0) ? (te .* 1f-3) : te
+        else
+            HDF5.attributes(g)["TE_s"] = Float32[]
+        end
+        HDF5.attributes(g)["status"] = "not_available"
     end
 end

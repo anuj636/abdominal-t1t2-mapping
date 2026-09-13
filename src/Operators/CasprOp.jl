@@ -139,7 +139,7 @@ function CuCasprOp(profiles, reconSize, numContr, numChan)
         (res, x) -> cuprod_caspr!(res, x, profiles_gpu, reconSize, numContr, numChan, numTFE, numShots),
         nothing,
         (res, x) -> cuctprod_caspr!(res, x, profiles_gpu, reconSize, numContr, numChan, numTFE, numShots),
-        S=CuArray{ComplexF32, 1, CUDA.Mem.DeviceBuffer})
+        S=CuVector{ComplexF32})
 end
 
 # ─── GPU implementation with TFE relaxation weighting ─────────────────────────
@@ -242,5 +242,5 @@ function CuCasprOpDiff(profiles, reconSize, numContr, numChan, flipAngle, TR)
         (res, x) -> cuprod_caspr_diff!(res, x, profiles_gpu, tfe_weights_gpu, reconSize, numContr, numChan, numTFE, numShots),
         nothing,
         (res, x) -> cuctprod_caspr_diff!(res, x, profiles_gpu, tfe_weights_gpu, reconSize, numContr, numChan, numTFE, numShots),
-        S=CuArray{ComplexF32, 1, CUDA.Mem.DeviceBuffer})
+        S=CuVector{ComplexF32})
 end

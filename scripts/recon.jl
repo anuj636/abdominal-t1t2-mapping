@@ -12,9 +12,10 @@ filename = "data/phantom/csbffe_from_mrtools_presort.jld2"
 motionCorrrection = false # No soft-gating for phantom scan
 
 # Use conservative settings for GPUs with limited VRAM (e.g. 12-16 GB).
-# Set to true for full reconstruction, false for quick testing
-lowMemoryMode = false
-testMode = true  # Set to false for production
+# These modes are opt-in via environment flags to avoid accidental non-production runs.
+lowMemoryMode = get(ENV, "RECON_LOW_MEMORY", "0") == "1"
+testMode = get(ENV, "RECON_TEST_MODE", "0") == "1"
+@info "recon.jl mode flags" lowMemoryMode=lowMemoryMode testMode=testMode
 
 # Load raw data with some preprocessing steps performed
 r = jldopen(filename)["r"]

@@ -14,15 +14,15 @@ mutable struct DiagOp{T} <: AbstractLinearOperator{T}
     args5 :: Bool
     use_prod5! :: Bool
     allocated5 :: Bool
-    Mv5 :: Vector{T}
-    Mtu5 :: Vector{T}
+    Mv :: Vector{T}
+    Mtu :: Vector{T}
     ops
     equalOps :: Bool
     xIdx :: Vector{Int}
     yIdx :: Vector{Int}
   end
   
-LinearOperators.storage_type(op::DiagOp) = typeof(op.Mv5)
+LinearOperators.storage_type(op::DiagOp) = typeof(op.Mv)
 
 function DiagOp(ops :: AbstractLinearOperator...)
     nrow = 0
@@ -36,7 +36,8 @@ function DiagOp(ops :: AbstractLinearOperator...)
   
     xIdx = cumsum(vcat(1,[ops[i].ncol for i=1:length(ops)]))
     yIdx = cumsum(vcat(1,[ops[i].nrow for i=1:length(ops)]))
-    batch_size = 200
+    batch_size = get(ENV, "RECON_DIAGOP_BATCH_SIZE", "64")
+    batch_size = max(1, parse(Int, batch_size))
   
     Op = DiagOp{S}( nrow, ncol, false, false,
         (res,x) -> (diagOpProd(res,x,nrow,xIdx,yIdx,batch_size,ops...)),
@@ -66,6 +67,20 @@ function DiagOp(op::AbstractLinearOperator, N=1)
 end
  
 function diagOpProd(y::AbstractVector{T}, x::AbstractVector{T}, nrow::Int, xIdx, yIdx, batch_size, ops :: AbstractLinearOperator...) where T
+    use_cuda = false
+    try
+        use_cuda = CUDA.functional()
+    catch
+        use_cuda = false
+    end
+
+    if !use_cuda
+        for i = 1:length(ops)
+            mul!(view(y, yIdx[i]:yIdx[i+1]-1), ops[i], view(x, xIdx[i]:xIdx[i+1]-1))
+        end
+        return y
+    end
+
     # @floop for i=1:length(ops)
     # x_gpu = CuArray(x)
     # y_gpu = CuArray(y)
@@ -122,6 +137,20 @@ function diagOpProd(y::AbstractVector{T}, x::AbstractVector{T}, nrow::Int, xIdx,
 end
 
 function diagOpTProd(y::AbstractVector{T}, x::AbstractVector{T}, ncol::Int, xIdx, yIdx, batch_size, ops :: AbstractLinearOperator...) where T
+    use_cuda = false
+    try
+        use_cuda = CUDA.functional()
+    catch
+        use_cuda = false
+    end
+
+    if !use_cuda
+        for i = 1:length(ops)
+            mul!(view(y, yIdx[i]:yIdx[i+1]-1), transpose(ops[i]), view(x, xIdx[i]:xIdx[i+1]-1))
+        end
+        return y
+    end
+
     # @floop for i=1:length(ops)
     # x_gpu = CuArray(x)
     # y_gpu = CuArray(y)
@@ -179,6 +208,20 @@ function diagOpTProd(y::AbstractVector{T}, x::AbstractVector{T}, ncol::Int, xIdx
 end
 
 function diagOpCTProd(y::AbstractVector{T}, x::AbstractVector{T}, ncol::Int, xIdx, yIdx, batch_size, ops :: AbstractLinearOperator...) where T
+    use_cuda = false
+    try
+        use_cuda = CUDA.functional()
+    catch
+        use_cuda = false
+    end
+
+    if !use_cuda
+        for i = 1:length(ops)
+            mul!(view(y, yIdx[i]:yIdx[i+1]-1), adjoint(ops[i]), view(x, xIdx[i]:xIdx[i+1]-1))
+        end
+        return y
+    end
+
     # # @floop for i=1:length(ops)
     # x_gpu = CuArray(x)
     # y_gpu = CuArray(y)
@@ -250,8 +293,8 @@ mutable struct CuDiagOp{T, S} <: AbstractLinearOperator{T}
     args5 :: Bool
     use_prod5! :: Bool
     allocated5 :: Bool
-    Mv5 :: S
-    Mtu5 :: S
+    Mv :: S
+    Mtu :: S
     ops
     equalOps :: Bool
     xIdx :: Vector{Int}
@@ -260,7 +303,7 @@ end
   
 CuDiagOp(ops::AbstractLinearOperator...) = CuDiagOp(ops)
 
-LinearOperators.storage_type(op::CuDiagOp) = typeof(op.Mv5)
+LinearOperators.storage_type(op::CuDiagOp) = typeof(op.Mv)
 
 function CuDiagOp(ops)
     nrow = 0
@@ -277,13 +320,13 @@ function CuDiagOp(ops)
     xIdx = cumsum(vcat(1,[ops[i].ncol for i=1:length(ops)]))
     yIdx = cumsum(vcat(1,[ops[i].nrow for i=1:length(ops)]))
 
-    Mv5, Mtu5 = S(undef, 0), S(undef, 0)
+    Mv, Mtu = S(undef, 0), S(undef, 0)
   
     Op = CuDiagOp{type, S}( nrow, ncol, false, false,
                        (res,x) -> (cuDiagOpProd(res,x,nrow,xIdx,yIdx,ops...)),
                        (res,y) -> (cuDiagOpTProd(res,y,ncol,yIdx,xIdx,ops...)),
                        (res,y) -> (cuDiagOpCTProd(res,y,ncol,yIdx,xIdx,ops...)),
-                       0, 0, 0, false, false, false, Mv5, Mtu5,
+                       0, 0, 0, false, false, false, Mv, Mtu,
                        [ops...], false, xIdx, yIdx)
   
     return Op

@@ -78,7 +78,7 @@ function constructOperators(r::ReconParams{<:Union{KdataPreprocessed{T}, KdataRe
     if typeof(r.traj) == Cartesian3D
         if cudaSolver
             @debug("FFTOp on GPU")
-            ft = [LinearOperatorCollection.FFTOp(Complex{T}; shape=reconSize, unitary=false, S=CuArray{Complex{T}, 1, CUDA.Mem.DeviceBuffer}) for j=1:numContr]
+            ft = [LinearOperatorCollection.FFTOp(Complex{T}; shape=reconSize, unitary=false, S=CuVector{Complex{T}}) for j=1:numContr]
         else            
             @debug("cuFFTOp (not fully CUDA supported)")
             ft = [ReconBMRR.cuFFTOp(Complex{T}, reconSize; cuda=r.reconParameters[:cuda], unitary=false) for j=1:numContr]
@@ -160,7 +160,7 @@ end
 function getRegularization(r::ReconParams{KdataPreprocessed{T}, <:AbstractTrajectory}, reconSize::Tuple, 
     numEchoesNumDyn::Int, numMotionStates::Int, numCoils::Int) where T<:AbstractFloat
     if r.reconParameters[:cudaSolver]
-        opType = CuArray{Complex{T}, 1, CUDA.Mem.DeviceBuffer}
+        opType = CuVector{Complex{T}}
     else
         opType = Vector{Complex{T}}
     end

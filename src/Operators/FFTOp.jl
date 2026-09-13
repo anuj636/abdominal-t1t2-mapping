@@ -14,15 +14,15 @@ mutable struct FFTOpImpl{T} <: LinearOperatorCollection.FFTOp{T}
   args5 :: Bool
   use_prod5! :: Bool
   allocated5 :: Bool
-  Mv5 :: Vector{T}
-  Mtu5 :: Vector{T}
+  Mv :: Vector{T}
+  Mtu :: Vector{T}
   plan
   iplan
   shift::Bool
   unitary::Bool
 end
 
-LinearOperators.storage_type(op::FFTOpImpl) = typeof(op.Mv5)
+LinearOperators.storage_type(op::FFTOpImpl) = typeof(op.Mv)
 
 """
   FFTOp(T::Type, shape::Tuple, shift=true, unitary=true)

@@ -1,7 +1,12 @@
+authors = ["Jonathan Stelter <jonathan.stelter@tum.de>"]
 name = "ReconBMRR"
 uuid = "7eac4ef9-8e83-4a27-a336-806a79324787"
-authors = ["Jonathan Stelter <jonathan.stelter@tum.de>"]
 version = "2.1.0"
+
+[compat]
+LinearOperatorCollection = "2.0"
+RegularizedLeastSquares = "0.16"
+julia = "1.10"
 
 [deps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
@@ -42,7 +47,5 @@ StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 Suppressor = "fd094767-a336-5f1f-9728-57cf17d0bbfb"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
-[compat]
-LinearOperatorCollection = "2.0"
-RegularizedLeastSquares = "0.16"
-julia = "1.9"
+[extras]
+CUDA_Runtime_jll = "76a88914-d11a-5bdc-97e0-2f5a05c973a2"

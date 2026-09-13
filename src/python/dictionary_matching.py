@@ -4,6 +4,12 @@ from numba import njit, prange
 import copy
 import warnings
 
+def _nearest_dictionary_index(dict_param, target, atol=1e-4):
+    ind = np.argwhere((np.abs(dict_param - target) < atol).all(axis=1) == True)
+    if ind.size > 0:
+        return int(ind.flatten()[0]), False
+    return int(np.argmin(np.linalg.norm(dict_param - target, axis=1))), True
+
 def dictionary_matching(signal, dictionary, params, mask, tmp_dict, tmp_psf, plot_signal=None, 
                         plot_landscape=None, complex_dict=True, compute_pd=True):
     real_signal = np.reshape(signal, [int(np.prod(signal.shape[:-1])),
@@ -27,39 +33,13 @@ def dictionary_matching(signal, dictionary, params, mask, tmp_dict, tmp_psf, plo
         n_dict_features = tmp_dict.shape[-1]
         n_signal_features = real_signal.shape[-1]
         if n_signal_features != n_dict_features:
-            if n_signal_features > n_dict_features:
-                action = f"truncated to the first {n_dict_features} features"
-                accuracy_note = (
-                    "Truncation is physically valid only if both the signal and dictionary "
-                    "subspace bases share the same SVD ordering (e.g. the signal was "
-                    f"reconstructed with {n_signal_features} subspace components and "
-                    f"subspaceBasis stores only the leading {n_dict_features})."
-                )
-            else:
-                action = f"zero-padded from {n_signal_features} to {n_dict_features} features"
-                accuracy_note = (
-                    "Zero-padding is unlikely to produce physically accurate results. "
-                    "Ensure the signal and dictionary are in the same subspace."
-                )
-            warnings.warn(
+            raise ValueError(
                 f"Signal feature dimension ({n_signal_features}) does not match dictionary "
-                f"feature dimension ({n_dict_features}). The signal will be {action}. "
-                f"{accuracy_note} "
-                f"The root cause is typically that the reconstruction used a different number "
-                f"of subspace components than what is stored in subspaceBasis.",
-                stacklevel=3
+                f"feature dimension ({n_dict_features}). The reconstruction and dictionary "
+                "must use the same physical feature basis before matching. Do not rely on "
+                "silent truncation or zero-padding here; fix the upstream basis contract "
+                "instead."
             )
-            if n_signal_features > n_dict_features:
-                real_signal = real_signal[:, :n_dict_features]
-                real_signal_test = real_signal_test[:, :n_dict_features]
-            else:
-                pad_width = n_dict_features - n_signal_features
-                real_signal = np.pad(real_signal, ((0, 0), (0, pad_width)))
-                real_signal_test = np.pad(real_signal_test, ((0, 0), (0, pad_width)))
-            # Re-normalise after reshaping the signal
-            l2_signal_adj = np.sqrt(np.sum(np.square(np.abs(real_signal)), axis=-1))
-            l2_signal_adj[l2_signal_adj == 0] = 1.0
-            real_signal = real_signal / l2_signal_adj[:, np.newaxis]
 
         # err = np.zeros((real_signal.shape[0], tmp_dict.shape[1]))
         # for i in range(len(fieldmap_dict)):
@@ -164,17 +144,23 @@ def prepare_dictionary(dictionary, params, complex_dict=True):
 
         prof_ord_indices = [0, tmp_dict.shape[-1]//2 , -1]
         for i in range(nte):
-            ind = np.argwhere((np.abs(dict_param - np.array([params['duration'][i],
-                                                             params['angle'][i],
-                                                             params['delay'][i]]))<1e-4).all(axis=1) == True)
+            target = np.array([params['duration'][i],
+                               params['angle'][i],
+                               params['delay'][i]])
+            lookup_idx, used_nearest = _nearest_dictionary_index(dict_param, target)
+            if used_nearest:
+                warnings.warn(
+                    f"No exact dictionary match for duration/angle/delay={target}; using nearest entry index {lookup_idx}.",
+                    stacklevel=1,
+                )
             print(dict_param)
             print(params["duration"][i])
             print(params["angle"][i])
             print(params["delay"][i])
-            dict_te_series[..., i, :] = tmp_dict[..., ind.flatten()[0], :, prof_ord_indices[params["prof_ordering"][i]]]
+            dict_te_series[..., i, :] = tmp_dict[..., lookup_idx, :, prof_ord_indices[params["prof_ordering"][i]]]
             print(dict_te_series.shape)
             if tmp_psf is not None:
-                psf_te_series[..., i, :] = tmp_psf[..., ind.flatten()[0], :]
+                psf_te_series[..., i, :] = tmp_psf[..., lookup_idx, :]
         tmp_dict = np.reshape(dict_te_series, np.concatenate((list(tmp_dict.shape[:-3]), [nte*tmp_dict.shape[-2]])))
         print(tmp_dict.shape)
         if tmp_psf is not None:
@@ -196,10 +182,16 @@ def prepare_dictionary(dictionary, params, complex_dict=True):
                                                       [nte, tmp_psf.shape[-1]]))))
         prof_ord_indices = [0, tmp_dict.shape[-1]//2 , -1]
         for i in range(nte):
-            ind = np.argwhere((np.abs(dict_param - np.array([params['duration'][i],
-                                                             params['angle'][i],
-                                                             params['delay'][i],
-                                                             params['startup_delay'][i]]))<1e-6).all(axis=1) == True)
+            target = np.array([params['duration'][i],
+                               params['angle'][i],
+                               params['delay'][i],
+                               params['startup_delay'][i]])
+            lookup_idx, used_nearest = _nearest_dictionary_index(dict_param, target, atol=1e-6)
+            if used_nearest:
+                warnings.warn(
+                    f"No exact dictionary match for duration/angle/delay/startup={target}; using nearest entry index {lookup_idx}.",
+                    stacklevel=1,
+                )
             # print(np.abs(dict_param - np.array([params['duration'][i],
             #                                                  params['angle'][i],
             #                                                  params['delay'][i],
@@ -207,11 +199,10 @@ def prepare_dictionary(dictionary, params, complex_dict=True):
             # print(params['duration'][i])
             # print(params['angle'][i])
             # print(params['delay'][i])
-            # dict_te_series[..., i] = tmp_dict[..., ind.flatten()[0]]
-            # print(ind.flatten())
-            dict_te_series[..., i] = tmp_dict[..., ind.flatten()[0], prof_ord_indices[params["prof_ordering"][i]]]
+            # dict_te_series[..., i] = tmp_dict[..., lookup_idx]
+            dict_te_series[..., i] = tmp_dict[..., lookup_idx, prof_ord_indices[params["prof_ordering"][i]]]
             if tmp_psf is not None:
-                psf_te_series[..., i, :] = tmp_psf[..., ind.flatten()[0], :]
+                psf_te_series[..., i, :] = tmp_psf[..., lookup_idx, :]
         tmp_dict = dict_te_series
         if tmp_psf is not None:
             tmp_psf = psf_te_series
@@ -254,12 +245,18 @@ def prepare_dictionary_profiles(dictionary, params, subspace_basis, complex_dict
         psf_te_series = np.zeros((np.concatenate((list(tmp_psf.shape[:-2]),
                                                     [nte, tmp_psf.shape[-1]]))))
     for i in range(nte):
-        ind = np.argwhere((np.abs(dict_param - np.array([params['duration'][i],
-                                                            params['angle'][i],
-                                                            params['delay'][i]]))<1e-4).all(axis=1) == True)
-        dict_te_series[..., i, :, :] = tmp_dict[..., ind.flatten()[0], :, :]
+        target = np.array([params['duration'][i],
+                           params['angle'][i],
+                           params['delay'][i]])
+        lookup_idx, used_nearest = _nearest_dictionary_index(dict_param, target)
+        if used_nearest:
+            warnings.warn(
+                f"No exact dictionary match for duration/angle/delay={target}; using nearest entry index {lookup_idx}.",
+                stacklevel=1,
+            )
+        dict_te_series[..., i, :, :] = tmp_dict[..., lookup_idx, :, :]
         if tmp_psf is not None:
-            psf_te_series[..., i, :] = tmp_psf[..., ind.flatten()[0], :]
+            psf_te_series[..., i, :] = tmp_psf[..., lookup_idx, :]
     tmp_dict = np.reshape(dict_te_series, np.concatenate((list(tmp_dict.shape[:-3]), [nte*tmp_dict.shape[-2]*tmp_dict.shape[-1]])))
     print(tmp_dict.shape)
     if tmp_psf is not None:

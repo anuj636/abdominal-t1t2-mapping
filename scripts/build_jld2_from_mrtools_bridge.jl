@@ -5,6 +5,15 @@ using NPZ
 using JLD2
 using ReconBMRR
 
+const BRIDGE_DEBUG_LABELS = get(ENV, "BRIDGE_DEBUG_LABELS", "0") == "1"
+const BRIDGE_ENFORCE_EXPECTED_VIEWS = get(ENV, "BRIDGE_ENFORCE_EXPECTED_VIEWS", "0") == "1"
+const BRIDGE_EXPECTED_VIEW_COUNT = try
+    parse(Int, get(ENV, "BRIDGE_EXPECTED_VIEW_COUNT", "28"))
+catch
+    28
+end
+const BRIDGE_INTERLEAVE_SOURCE = lowercase(get(ENV, "BRIDGE_INTERLEAVE_SOURCE", "auto"))
+
 function build_label_lookup_table(n::Int)
     return Any[
         reshape(Float64.(collect(1:n)), 1, :),  # accImagData indices
@@ -120,6 +129,75 @@ function build_kdatapreprocessed_from_bridge(
     end
     
     return ReconBMRR.KdataPreprocessed(kdata), profileOrder
+end
+
+function maybe_debug_bridge_labels(ky, kz, echo, dyn, chan, extr1)
+    BRIDGE_DEBUG_LABELS || return
+
+    uniq_dyn = unique(dyn)
+    uniq_chan = unique(chan)
+    uniq_extr1 = unique(extr1)
+
+    println("[BRIDGE-LABELS] unique counts: " *
+            "ky=$(length(unique(ky))) kz=$(length(unique(kz))) " *
+            "echo=$(length(unique(echo))) dyn=$(length(uniq_dyn)) " *
+            "chan=$(length(uniq_chan)) extr1=$(length(uniq_extr1))")
+
+    println("[BRIDGE-LABELS] dyn sample: " * string(collect(uniq_dyn[1:min(end, 12)])))
+    println("[BRIDGE-LABELS] chan sample: " * string(collect(uniq_chan[1:min(end, 12)])))
+    println("[BRIDGE-LABELS] extr1 sample: " * string(collect(uniq_extr1[1:min(end, 12)])))
+
+    if BRIDGE_ENFORCE_EXPECTED_VIEWS
+        counts = (length(uniq_dyn), length(uniq_chan), length(uniq_extr1))
+        if BRIDGE_EXPECTED_VIEW_COUNT ∉ counts
+            error("Expected view cardinality $(BRIDGE_EXPECTED_VIEW_COUNT) not found in dyn/chan/extr1 counts $(counts). " *
+                  "Label assignment likely inconsistent with reference pipeline.")
+        end
+    end
+end
+
+function select_interleave_labels(
+    extr1::Vector{UInt16},
+    view_idx::Vector{Int32},
+    dyn::Vector{UInt16},
+    card::Vector{UInt16},
+)
+    uniq_extr1 = unique(extr1)
+    uniq_dyn = unique(dyn)
+    uniq_card = unique(card)
+    uniq_view = isempty(view_idx) ? Int32[] : unique(view_idx)
+
+    if BRIDGE_INTERLEAVE_SOURCE == "auto"
+        if length(uniq_card) > 1 && length(uniq_extr1) == 1
+            println("[BUILD] Auto interleave selection: using cardiac phase labels for Look-Locker semantics")
+            return card, :card
+        elseif !isempty(view_idx) && !any(view_idx .< 0)
+            println("[BUILD] Auto interleave selection: using view_idx labels")
+            return UInt16.(view_idx), :view_idx
+        else
+            println("[BUILD] Auto interleave selection: falling back to extr1 labels")
+            return extr1, :extr1
+        end
+    elseif BRIDGE_INTERLEAVE_SOURCE == "view_idx"
+        if isempty(view_idx)
+            @warn "BRIDGE_INTERLEAVE_SOURCE=view_idx requested but view_idx is missing; using extr1"
+            return extr1, :extr1
+        elseif any(view_idx .< 0)
+            @warn "BRIDGE_INTERLEAVE_SOURCE=view_idx requested but view_idx contains negative values; using extr1"
+            return extr1, :extr1
+        else
+            return UInt16.(view_idx), :view_idx
+        end
+    elseif BRIDGE_INTERLEAVE_SOURCE == "dyn"
+        return dyn, :dyn
+    elseif BRIDGE_INTERLEAVE_SOURCE == "card"
+        return card, :card
+    elseif BRIDGE_INTERLEAVE_SOURCE == "extr1"
+        return extr1, :extr1
+    else
+        @warn "Unknown BRIDGE_INTERLEAVE_SOURCE; using extr1" source=BRIDGE_INTERLEAVE_SOURCE
+        return extr1, :extr1
+    end
 end
 
 function validate_output_jld2(path::String)
@@ -268,6 +346,86 @@ function as_vector_int8(x)
     return Int8.(vec(x))
 end
 
+function get_echo_times_s(bridge::AbstractDict{String,<:Any}, n_echoes::Int, tr_raw::Float32)
+    if haskey(bridge, "TE_s")
+        te = Float32.(vec(bridge["TE_s"]))
+        if length(te) >= n_echoes
+            return te[1:n_echoes]
+        end
+    end
+
+    if haskey(bridge, "te_s")
+        te = Float32.(vec(bridge["te_s"]))
+        if length(te) >= n_echoes
+            return te[1:n_echoes]
+        end
+    end
+
+    if haskey(bridge, "TE")
+        te = Float32.(vec(bridge["TE"]))
+        if length(te) >= n_echoes
+            # Heuristic: TE values above 0.1 are likely milliseconds.
+            return maximum(te) > 0.1f0 ? (te[1:n_echoes] .* 1f-3) : te[1:n_echoes]
+        end
+    end
+
+    if haskey(bridge, "te")
+        te = Float32.(vec(bridge["te"]))
+        if length(te) >= n_echoes
+            # Heuristic: TE values above 0.1 are likely milliseconds.
+            return maximum(te) > 0.1f0 ? (te[1:n_echoes] .* 1f-3) : te[1:n_echoes]
+        end
+    end
+
+    tr_s = tr_raw > 0.1f0 ? tr_raw * 1f-3 : tr_raw
+    dt = tr_s > 0f0 ? max(tr_s / Float32(n_echoes + 1), 1f-3) : 1f-3
+    return Float32.(collect(1:n_echoes) .* dt)
+end
+
+function normalize_vec3(v, default::Float32)
+    if v isa AbstractArray
+        vv = Float32.(vec(v))
+        if length(vv) >= 3
+            return vv[1:3]
+        end
+    end
+    return Float32[default, default, default]
+end
+
+function get_encoding_size(scan::Dict{Symbol,Any}, bridge::AbstractDict{String,<:Any}, fallback::Vector{Int32}; prefer_existing::Bool=false)
+    if prefer_existing && haskey(scan, :encodingSize)
+        es = Int32.(vec(scan[:encodingSize]))
+        if length(es) >= 3 && all(es[1:3] .> 0)
+            return es[1:3]
+        end
+    end
+    if haskey(bridge, "scanner_recon_resolutions")
+        srr = Int32.(vec(bridge["scanner_recon_resolutions"]))
+        if length(srr) >= 3 && all(srr[1:3] .> 0)
+            if haskey(bridge, "recon_resolutions")
+                rr = Int32.(vec(bridge["recon_resolutions"]))
+                if length(rr) >= 3 && rr[1:3] != srr[1:3]
+                    @warn "scanner_recon_resolutions differs from recon_resolutions; preferring scanner values" recon=rr[1:3] scanner=srr[1:3]
+                end
+            end
+            return srr[1:3]
+        end
+    end
+    if haskey(bridge, "recon_resolutions")
+        rr = Int32.(vec(bridge["recon_resolutions"]))
+        if length(rr) >= 3 && all(rr[1:3] .> 0)
+            return rr[1:3]
+        end
+    end
+    if haskey(scan, :encodingSize)
+        es = Int32.(vec(scan[:encodingSize]))
+        if length(es) >= 3 && all(es[1:3] .> 0)
+            return es[1:3]
+        end
+    end
+    return Int32.(fallback)
+end
+
 bridge_npz, template_jld2, out_jld2, use_presort = parse_args(ARGS)
 bridge = NPZ.npzread(bridge_npz)
 has_template = !isnothing(template_jld2)
@@ -286,11 +444,29 @@ card = as_vector_uint16(bridge["card"])
 sign = as_vector_int8(bridge["sign"])
 typ = UInt8.(vec(bridge["typ"]))
 mix = as_vector_uint16(bridge["mix"])
+seq_nr = haskey(bridge, "seq_nr") ? as_vector_int32(bridge["seq_nr"]) : Int32[]
+view_idx = haskey(bridge, "view_idx") ? as_vector_int32(bridge["view_idx"]) : Int32[]
+extr1_original = haskey(bridge, "extr1_original") ? as_vector_int32(bridge["extr1_original"]) : Int32[]
+
+extr1_selected, interleave_source_used = select_interleave_labels(extr1, view_idx, dyn, card)
+println("[BUILD] Interleave source used: " * String(interleave_source_used))
+
+maybe_debug_bridge_labels(ky, kz, echo, dyn, chan, extr1_selected)
 
 if length(ky) != n || length(kz) != n || length(echo) != n || length(dyn) != n ||
-   length(chan) != n || length(extr1) != n || length(card) != n || length(sign) != n ||
+   length(chan) != n || length(extr1_selected) != n || length(card) != n || length(sign) != n ||
    length(typ) != n || length(mix) != n
     error("Bridge arrays do not have consistent length n=$n")
+end
+
+if !isempty(seq_nr) && length(seq_nr) != n
+    error("Bridge field seq_nr has inconsistent length $(length(seq_nr)) != n=$n")
+end
+if !isempty(view_idx) && length(view_idx) != n
+    error("Bridge field view_idx has inconsistent length $(length(view_idx)) != n=$n")
+end
+if !isempty(extr1_original) && length(extr1_original) != n
+    error("Bridge field extr1_original has inconsistent length $(length(extr1_original)) != n=$n")
 end
 
 scan = build_scan_parameters_base()
@@ -298,7 +474,7 @@ scan = build_scan_parameters_base()
 # Build data object based on presort flag
 if use_presort
     println("[BUILD] Using pre-sorted KdataPreprocessed path (skips sortData)")
-    kdata, profileOrder = build_kdatapreprocessed_from_bridge(acc_imag_data, ky, kz, echo, dyn, chan, extr1, num_kx)
+    kdata, profileOrder = build_kdatapreprocessed_from_bridge(acc_imag_data, ky, kz, echo, dyn, chan, extr1_selected, num_kx)
     labels = Dict{Symbol, Any}()  # Empty for preprocessed, we embed info in the 7D array structure
 else
     profileOrder = nothing
@@ -308,13 +484,22 @@ else
         :echo => echo,
         :dyn => dyn,
         :chan => chan,
-        :extr1 => extr1,
+        :extr1 => extr1_selected,
         :card => card,
         :sign => sign,
         :typ => typ,
         :mix => mix,
         :LabelLookupTable => build_label_lookup_table(n),
     )
+    if !isempty(seq_nr)
+        labels[:seq_nr] = seq_nr
+    end
+    if !isempty(view_idx)
+        labels[:view_idx] = view_idx
+    end
+    if !isempty(extr1_original)
+        labels[:extr1_original] = extr1_original
+    end
 
     rej_imag_data = zeros(ComplexF32, num_kx, 0)
     phase_corr_data = zeros(ComplexF32, num_kx, 0)
@@ -344,13 +529,39 @@ scan[:KyRange] = collect(ky_min:ky_max)
 scan[:KzRange] = collect(kz_min:kz_max)
 scan[:KxRange] = collect(Int32(0):Int32(num_kx - 1))
 scan[:TFEfactor] = max(1, Int(get_scalar(bridge, "tfe_factor", 1)))
-scan[:encodingSize] = Int32[num_kx, ky_max - ky_min + 1, kz_max - kz_min + 1]
+scan[:encodingSize] = get_encoding_size(
+    scan,
+    bridge,
+    Int32[num_kx, ky_max - ky_min + 1, kz_max - kz_min + 1];
+    prefer_existing=has_template,
+)
 scan[:AcqMode] = "Cartesian"
+
+scan[:AcqVoxelSize] = normalize_vec3(get(scan, :AcqVoxelSize, Float32[]), 1.0f0)
+scan[:RecVoxelSize] = normalize_vec3(get(scan, :RecVoxelSize, Float32[]), 1.0f0)
+fov = normalize_vec3(get(scan, :FOV, Float32[]), 0.0f0)
+expected_encoding = Int32.(round.(Int, fov ./ scan[:RecVoxelSize]))
+if any(fov .<= 0.0f0) || any(abs.(expected_encoding .- scan[:encodingSize]) .> 1)
+    # Keep FOV and encodingSize consistent to prevent oversampling crop to 1x1x1.
+    fov = Float32.(scan[:encodingSize]) .* scan[:RecVoxelSize]
+end
+scan[:FOV] = fov
 
 tr = Float32(get_scalar(bridge, "tr", scan[:TR]))
 flip = Float32(get_scalar(bridge, "flip_angle", scan[:FlipAngle]))
 scan[:TR] = tr
 scan[:FlipAngle] = flip
+
+n_echoes = max(1, Int(maximum(echo)) + 1)
+te_s = get_echo_times_s(bridge, n_echoes, tr)
+scan[:TE_s] = te_s
+scan[:TE] = te_s
+
+if !haskey(scan, :centerFreq_Hz)
+    b0 = haskey(scan, :FieldStrength) ? Float32(scan[:FieldStrength]) : 3.0f0
+    # Proton gyromagnetic ratio in Hz/T.
+    scan[:centerFreq_Hz] = Float32(42.57747892f6) * b0
+end
 
 recon = build_recon_parameters_base(scan)
 
@@ -390,12 +601,20 @@ else
     println("[BUILD] No template provided; using package-native defaults")
 end
 
-jldsave(out_jld2; r=r)
+if use_presort
+    println("[BUILD] Writing pre-sorted JLD2 with compression over IOStream")
+    jldsave(out_jld2, true, IOStream; r=r)
+else
+    jldsave(out_jld2; r=r)
+end
 
 if !use_presort
     validate_output_jld2(out_jld2)
 else
-    println("[POST-BUILD] Skipping full validation for pre-sorted data (structure is different)")
+    jldopen(out_jld2, "r") do f
+        f["r"]
+    end
+    println("[POST-BUILD] Reloaded pre-sorted JLD2 successfully")
     println("[POST-BUILD] KdataPreprocessed shape: ", size(kdata.kdata))
     println("[POST-BUILD] Ready for reconstruction (no sortData needed)")
 end

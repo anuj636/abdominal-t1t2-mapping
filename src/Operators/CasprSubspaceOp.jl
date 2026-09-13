@@ -94,5 +94,5 @@ function CuCasprSubspaceOp(profiles, basis, reconSize, numContr, numChan, weight
                        (res,x) -> cuprod_caspr_subspace!(res, x, profiles_gpu, basis_gpu, reconSize, numContr, numChan, numTFE, numShots, numBasis, numEchoes, weights_gpu),
                        nothing,
                        (res,x) -> cuctprod_caspr_subspace!(res, x, profiles_gpu, basis_gpu, reconSize, numContr, numChan, numTFE, numShots, numBasis, numEchoes, weights_gpu),
-                       S=S=CuArray{ComplexF32, 1, CUDA.Mem.DeviceBuffer})
+                       S=CuVector{ComplexF32})
 end
