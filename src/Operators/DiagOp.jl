@@ -353,23 +353,56 @@ end
 #     return Op
 # end
 
+const _DIAGOP_SYNC = Ref{Bool}(get(ENV, "RECON_DIAGOP_SYNC", "0") == "1")
+
+@noinline function _diagop_check(dst, src, expectDst::Int, expectSrc::Int, i::Int, nops::Int, op, label::String)
+    if length(dst) != expectDst || length(src) != expectSrc
+        error("CuDiagOp $label size mismatch at op $i/$nops: " *
+              "dst length=$(length(dst)) expected=$(expectDst), " *
+              "src length=$(length(src)) expected=$(expectSrc), " *
+              "op type=$(typeof(op))")
+    end
+    return nothing
+end
+
 function cuDiagOpProd(y::CuArray{T}, x::CuArray{T}, nrow::Int, xIdx, yIdx, ops :: AbstractLinearOperator...) where T
     for i=1:length(ops)
-      mul!(view(y,yIdx[i]:yIdx[i+1]-1), ops[i], view(x,xIdx[i]:xIdx[i+1]-1))
+      dst = view(y,yIdx[i]:yIdx[i+1]-1)
+      src = view(x,xIdx[i]:xIdx[i+1]-1)
+      _diagop_check(dst, src, ops[i].nrow, ops[i].ncol, i, length(ops), ops[i], "prod")
+      if _DIAGOP_SYNC[]
+        println(stdout, "[DIAGOP] prod i=$i/$(length(ops)) type=$(typeof(ops[i])) nrow=$(ops[i].nrow) ncol=$(ops[i].ncol)"); flush(stdout)
+      end
+      mul!(dst, ops[i], src)
+      _DIAGOP_SYNC[] && CUDA.synchronize()
     end
     return y
 end
   
 function cuDiagOpTProd(y::CuArray{T}, x::CuArray{T}, ncol::Int, xIdx, yIdx, ops :: AbstractLinearOperator...) where T
     for i=1:length(ops)
-      mul!(view(y,yIdx[i]:yIdx[i+1]-1), transpose(ops[i]), view(x,xIdx[i]:xIdx[i+1]-1))
+      dst = view(y,yIdx[i]:yIdx[i+1]-1)
+      src = view(x,xIdx[i]:xIdx[i+1]-1)
+      _diagop_check(dst, src, ops[i].ncol, ops[i].nrow, i, length(ops), ops[i], "tprod")
+      if _DIAGOP_SYNC[]
+        println(stdout, "[DIAGOP] tprod i=$i/$(length(ops)) type=$(typeof(ops[i])) nrow=$(ops[i].nrow) ncol=$(ops[i].ncol)"); flush(stdout)
+      end
+      mul!(dst, transpose(ops[i]), src)
+      _DIAGOP_SYNC[] && CUDA.synchronize()
     end
     return y
 end
   
 function cuDiagOpCTProd(y::CuArray{T}, x::CuArray{T}, ncol::Int, xIdx, yIdx, ops :: AbstractLinearOperator...) where T
     for i=1:length(ops)
-      mul!(view(y,yIdx[i]:yIdx[i+1]-1), adjoint(ops[i]), view(x,xIdx[i]:xIdx[i+1]-1))
+      dst = view(y,yIdx[i]:yIdx[i+1]-1)
+      src = view(x,xIdx[i]:xIdx[i+1]-1)
+      _diagop_check(dst, src, ops[i].ncol, ops[i].nrow, i, length(ops), ops[i], "ctprod")
+      if _DIAGOP_SYNC[]
+        println(stdout, "[DIAGOP] ctprod i=$i/$(length(ops)) type=$(typeof(ops[i])) nrow=$(ops[i].nrow) ncol=$(ops[i].ncol)"); flush(stdout)
+      end
+      mul!(dst, adjoint(ops[i]), src)
+      _DIAGOP_SYNC[] && CUDA.synchronize()
     end
     return y
 end

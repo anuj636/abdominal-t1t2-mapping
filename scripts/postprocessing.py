@@ -233,25 +233,18 @@ if os.path.exists(filename):
 
     signal_for_matching = obj.WFIparams["water"]
 
-    use_profiles = False
-    if "subspaceBasis" not in obj.ImDataParams:
+    # NOTE: when with_profiles=True, interface.py's perform_dictionary_matching
+    # projects the DICTIONARY down to the subspace-component domain via
+    # prepare_dictionary_profiles(..., subspaceBasis, ...) (tmp_dict @ subspace_
+    # basis -> last dim becomes n_components). The signal passed in must
+    # therefore stay in that SAME raw n_components domain (obj.WFIparams["water"]
+    # already is, post-reconstruction) - it must NOT be pre-expanded back up to
+    # the full dictionary feature count via project_signal_to_subspace(), which
+    # would create a component-count mismatch (see experiment/TODO.md 2026-09-14
+    # "postprocessing subspace contract bug").
+    use_profiles = "subspaceBasis" in obj.ImDataParams
+    if not use_profiles:
         print("subspaceBasis not found in reconstruction output; falling back to dictionary matching without profiles.")
-    else:
-        try:
-            signal_for_matching = project_signal_to_subspace(
-                signal_for_matching,
-                obj.ImDataParams["subspaceBasis"],
-            )
-            use_profiles = True
-        except Exception as e:
-            import warnings
-
-            warnings.warn(
-                "SubspaceBasis is present but projection failed; "
-                "falling back to dictionary matching without profiles. "
-                f"Reason: {e}",
-                stacklevel=1,
-            )
 
     n_signal_features = int(signal_for_matching.shape[-1])
     if not use_profiles and n_signal_features != n_dict_features:

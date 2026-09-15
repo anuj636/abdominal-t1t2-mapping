@@ -84,18 +84,29 @@ function build_kdatapreprocessed_from_bridge(
     dyn::Vector,
     chan::Vector,
     extr1::Vector,
-    num_kx::Int,
+    num_kx::Int;
+    nominal_ky_min::Union{Int,Nothing}=nothing,
+    nominal_ky_max::Union{Int,Nothing}=nothing,
+    nominal_kz_min::Union{Int,Nothing}=nothing,
+    nominal_kz_max::Union{Int,Nothing}=nothing,
 )
     """
     Build KdataPreprocessed directly from MRTOOLS bridge data, bypassing sortData().
     Returns tuple: (kdata_obj, trajectory)
     """
     
-    # Get unique values and ranges
-    ky_min = minimum(ky)
-    ky_max = maximum(ky)
-    kz_min = minimum(kz)
-    kz_max = maximum(kz)
+    # Get unique values and ranges. Reviewer-flagged issue (see TODO.md
+    # 2026-09-14 "200x75x141 k-space dimensions"): the ACQUIRED extent (this
+    # scan's accelerated CASPR trajectory never samples the outermost shell)
+    # is smaller than the NOMINAL encoding matrix from the .sin header. Using
+    # the nominal bounds (when available) keeps the reconstruction grid at
+    # the sequence's true designed FOV; the 2 missing outer shells on each
+    # side simply stay exact zero (already how undersampled positions are
+    # handled everywhere else in this pipeline).
+    ky_min = nominal_ky_min !== nothing ? nominal_ky_min : minimum(ky)
+    ky_max = nominal_ky_max !== nothing ? nominal_ky_max : maximum(ky)
+    kz_min = nominal_kz_min !== nothing ? nominal_kz_min : minimum(kz)
+    kz_max = nominal_kz_max !== nothing ? nominal_kz_max : maximum(kz)
     
     num_ky = ky_max - ky_min + 1
     num_kz = kz_max - kz_min + 1
@@ -128,6 +139,86 @@ function build_kdatapreprocessed_from_bridge(
         profileOrder[2, ky_idx, kz_idx, echo_idx, dyn_idx, inter_idx] = kz[i]
     end
     
+    return ReconBMRR.KdataPreprocessed(kdata), profileOrder
+end
+
+function build_kdatapreprocessed_caspr_subspace_from_bridge(
+    acc_imag_data::Matrix{Complex{Float32}},
+    ky::Vector{Int32},
+    kz::Vector{Int32},
+    echo::Vector,
+    tfe_slot::Vector,
+    shot_repeat::Vector,
+    contr::Vector,
+    chan::Vector,
+    num_kx::Int,
+)
+    """
+    Build KdataPreprocessed indexed by CASPR shot/TFE structure instead of a
+    dense (ky,kz) Cartesian grid. This is required for CuCasprSubspaceOp,
+    which assumes profiles[2, numTFE, numShots, numEchoesContr] with:
+      - numTFE   = readout position within a shot (dictionary's TFE axis)
+      - numShots = repeat/execution index of a given (dyn,card) shot
+      - contr    = 0-based dyn*num_card+card, matching the dictionary's
+                   (TFE fastest, phase, delay slowest) flatten convention
+    See TODO.md "Track B" sections for the empirical derivation of
+    tfe_slot/shot_repeat from raw seq_nr, and Preprocessing.jl's
+    subspaceBasis! for the confirmed dictionary flatten order.
+
+    Returns tuple: (kdata_obj, trajectory)
+    """
+    n = size(acc_imag_data, 2)
+
+    valid = trues(n)
+    for i = 1:n
+        if tfe_slot[i] < 0 || shot_repeat[i] < 0
+            valid[i] = false
+        end
+    end
+    n_invalid = count(!, valid)
+    if n_invalid > 0
+        @warn("Skipping $n_invalid/$n profile(s) with unresolved tfe_slot/shot_repeat")
+    end
+
+    num_tfe = maximum(tfe_slot[valid]) + 1
+    num_shots = maximum(shot_repeat[valid]) + 1
+    num_echoes = maximum(echo) + 1
+    num_contr = maximum(contr[valid]) + 1
+    num_chan = maximum(chan) + 1
+
+    # Initialize 7D array: (kx, tfe, shots, echoes, contr, channels, interleaves=1)
+    kdata = zeros(ComplexF32, num_kx, num_tfe, num_shots, num_echoes, num_contr, num_chan, 1)
+
+    # Initialize trajectory: (2, tfe, shots, echoes, contr, interleaves=1)
+    # profileOrder[1, :] = ky indices, profileOrder[2, :] = kz indices.
+    # Default (unfilled) slots point at the first valid profile's (ky,kz);
+    # since the matching kdata entry stays exactly zero, downstream
+    # weighting (weightsMasked from dataTemp .== 0) excludes them from the
+    # forward/adjoint operator regardless of this placeholder trajectory.
+    profileOrder = zeros(Int, 2, num_tfe, num_shots, num_echoes, num_contr, 1)
+    first_valid = findfirst(valid)
+    if first_valid !== nothing
+        profileOrder[1, :, :, :, :, :] .= ky[first_valid]
+        profileOrder[2, :, :, :, :, :] .= kz[first_valid]
+    end
+
+    for i = 1:n
+        if !valid[i]
+            continue
+        end
+        tfe_idx = tfe_slot[i] + 1
+        shot_idx = shot_repeat[i] + 1
+        echo_idx = echo[i] + 1
+        contr_idx = contr[i] + 1
+        chan_idx = chan[i] + 1
+
+        kdata[:, tfe_idx, shot_idx, echo_idx, contr_idx, chan_idx, 1] .= acc_imag_data[:, i]
+        profileOrder[1, tfe_idx, shot_idx, echo_idx, contr_idx, 1] = ky[i]
+        profileOrder[2, tfe_idx, shot_idx, echo_idx, contr_idx, 1] = kz[i]
+    end
+
+    println("[BUILD-CASPR] numTFE=$num_tfe numShots=$num_shots numEchoes=$num_echoes numContr=$num_contr numChan=$num_chan")
+
     return ReconBMRR.KdataPreprocessed(kdata), profileOrder
 end
 
@@ -265,12 +356,14 @@ end
 
 function usage_and_exit()
     println("Usage:")
-    println("  julia scripts/build_jld2_from_mrtools_bridge.jl <bridge_npz> <output_jld2> [--template <template_jld2>] [--presort]")
-    println("  julia scripts/build_jld2_from_mrtools_bridge.jl <bridge_npz> <template_jld2> <output_jld2> [--presort]   # legacy")
+    println("  julia scripts/build_jld2_from_mrtools_bridge.jl <bridge_npz> <output_jld2> [--template <template_jld2>] [--presort|--presort-caspr]")
+    println("  julia scripts/build_jld2_from_mrtools_bridge.jl <bridge_npz> <template_jld2> <output_jld2> [--presort|--presort-caspr]   # legacy")
     println("")
     println("Options:")
-    println("  --template   Optional template JLD2. If omitted, package-native defaults are used.")
-    println("  --presort    Build KdataPreprocessed instead of KdataRaw (skips sortData)")
+    println("  --template       Optional template JLD2. If omitted, package-native defaults are used.")
+    println("  --presort        Build KdataPreprocessed on a dense (ky,kz) Cartesian grid (skips sortData)")
+    println("  --presort-caspr  Build KdataPreprocessed indexed by CASPR shot/TFE structure (tfe_slot,shot_repeat,contr),")
+    println("                   required for CuCasprSubspaceOp-based subspace reconstruction")
     exit(1)
 end
 
@@ -281,6 +374,7 @@ function parse_args(args::Vector{String})
 
     bridge_npz = args[1]
     use_presort = false
+    use_presort_caspr = false
     template_jld2 = nothing
     positional = String[]
 
@@ -289,6 +383,10 @@ function parse_args(args::Vector{String})
         arg = args[i]
         if arg == "--presort"
             use_presort = true
+            i += 1
+        elseif arg == "--presort-caspr"
+            use_presort = true
+            use_presort_caspr = true
             i += 1
         elseif arg == "--template"
             if i == length(args)
@@ -312,7 +410,7 @@ function parse_args(args::Vector{String})
         usage_and_exit()
     end
 
-    return bridge_npz, template_jld2, out_jld2, use_presort
+    return bridge_npz, template_jld2, out_jld2, use_presort, use_presort_caspr
 end
 
 function get_scalar(d::AbstractDict{String,<:Any}, key::String, default)
@@ -399,22 +497,30 @@ function get_encoding_size(scan::Dict{Symbol,Any}, bridge::AbstractDict{String,<
             return es[1:3]
         end
     end
-    if haskey(bridge, "scanner_recon_resolutions")
-        srr = Int32.(vec(bridge["scanner_recon_resolutions"]))
-        if length(srr) >= 3 && all(srr[1:3] .> 0)
-            if haskey(bridge, "recon_resolutions")
-                rr = Int32.(vec(bridge["recon_resolutions"]))
-                if length(rr) >= 3 && rr[1:3] != srr[1:3]
-                    @warn "scanner_recon_resolutions differs from recon_resolutions; preferring scanner values" recon=rr[1:3] scanner=srr[1:3]
-                end
-            end
-            return srr[1:3]
-        end
-    end
+    # NOTE (2026-09-14): recon_resolutions is grid-aligned (matches the k-space
+    # grid this pipeline actually reconstructs on, including the nominal-grid
+    # fix for the 200x75x141 discrepancy). scanner_recon_resolutions is the
+    # scanner's own clinical/interpolated recon matrix (e.g. 128x96x101) and is
+    # NOT the grid this custom minimal pipeline reconstructs on -- using it here
+    # made encodingSize/FOV mismatch the actual reconstructed image size,
+    # tripping the strict encoding-match check in recon_mrtools.jl. Prefer the
+    # grid-aligned value; scanner_recon_resolutions is kept only for logging.
     if haskey(bridge, "recon_resolutions")
         rr = Int32.(vec(bridge["recon_resolutions"]))
         if length(rr) >= 3 && all(rr[1:3] .> 0)
+            if haskey(bridge, "scanner_recon_resolutions")
+                srr = Int32.(vec(bridge["scanner_recon_resolutions"]))
+                if length(srr) >= 3 && srr[1:3] != rr[1:3]
+                    @warn "scanner_recon_resolutions differs from recon_resolutions; preferring grid-aligned recon_resolutions" recon=rr[1:3] scanner=srr[1:3]
+                end
+            end
             return rr[1:3]
+        end
+    end
+    if haskey(bridge, "scanner_recon_resolutions")
+        srr = Int32.(vec(bridge["scanner_recon_resolutions"]))
+        if length(srr) >= 3 && all(srr[1:3] .> 0)
+            return srr[1:3]
         end
     end
     if haskey(scan, :encodingSize)
@@ -426,7 +532,7 @@ function get_encoding_size(scan::Dict{Symbol,Any}, bridge::AbstractDict{String,<
     return Int32.(fallback)
 end
 
-bridge_npz, template_jld2, out_jld2, use_presort = parse_args(ARGS)
+bridge_npz, template_jld2, out_jld2, use_presort, use_presort_caspr = parse_args(ARGS)
 bridge = NPZ.npzread(bridge_npz)
 has_template = !isnothing(template_jld2)
 r_template = has_template ? jldopen(template_jld2)["r"] : nothing
@@ -447,6 +553,9 @@ mix = as_vector_uint16(bridge["mix"])
 seq_nr = haskey(bridge, "seq_nr") ? as_vector_int32(bridge["seq_nr"]) : Int32[]
 view_idx = haskey(bridge, "view_idx") ? as_vector_int32(bridge["view_idx"]) : Int32[]
 extr1_original = haskey(bridge, "extr1_original") ? as_vector_int32(bridge["extr1_original"]) : Int32[]
+tfe_slot = haskey(bridge, "tfe_slot") ? as_vector_int32(bridge["tfe_slot"]) : Int32[]
+shot_repeat = haskey(bridge, "shot_repeat") ? as_vector_int32(bridge["shot_repeat"]) : Int32[]
+contr = haskey(bridge, "contr") ? as_vector_int32(bridge["contr"]) : Int32[]
 
 extr1_selected, interleave_source_used = select_interleave_labels(extr1, view_idx, dyn, card)
 println("[BUILD] Interleave source used: " * String(interleave_source_used))
@@ -469,12 +578,40 @@ if !isempty(extr1_original) && length(extr1_original) != n
     error("Bridge field extr1_original has inconsistent length $(length(extr1_original)) != n=$n")
 end
 
+if use_presort_caspr
+    if isempty(tfe_slot) || isempty(shot_repeat) || isempty(contr)
+        error("--presort-caspr requires bridge fields tfe_slot, shot_repeat, contr (re-export with an updated export_reconbmrr_bridge.py)")
+    end
+    if length(tfe_slot) != n || length(shot_repeat) != n || length(contr) != n
+        error("Bridge fields tfe_slot/shot_repeat/contr have inconsistent length != n=$n")
+    end
+end
+
 scan = build_scan_parameters_base()
 
 # Build data object based on presort flag
-if use_presort
+if use_presort_caspr
+    println("[BUILD] Using CASPR shot/TFE-indexed KdataPreprocessed path (skips sortData, targets CuCasprSubspaceOp)")
+    kdata, profileOrder = build_kdatapreprocessed_caspr_subspace_from_bridge(acc_imag_data, ky, kz, echo, tfe_slot, shot_repeat, contr, chan, num_kx)
+    labels = Dict{Symbol, Any}()  # Empty for preprocessed, we embed info in the 7D array structure
+elseif use_presort
     println("[BUILD] Using pre-sorted KdataPreprocessed path (skips sortData)")
-    kdata, profileOrder = build_kdatapreprocessed_from_bridge(acc_imag_data, ky, kz, echo, dyn, chan, extr1_selected, num_kx)
+    # Use the nominal (sequence-designed) ky/kz encoding matrix bounds from
+    # the .sin header when available, rather than shrinking the grid to only
+    # this scan's acquired extent (see TODO.md 2026-09-14 "200x75x141
+    # k-space dimensions" reviewer finding). NOTE: the bridge exports a
+    # 1-element sentinel value (-1000000), NOT a 0-length array, to signal
+    # "absent" -- a 0-length 1D int32 array positioned after the multi-GB
+    # accImagData entry triggers a reproducible EOFError in Julia's
+    # NPZ.jl/ZipFile.jl (see TODO.md 2026-09-14 "NPZ.jl zero-length array" entry).
+    nominal_grid_sentinel = -1000000
+    read_nominal_bound(bridge, key) = haskey(bridge, key) ? (v = Int(only(bridge[key])); v == nominal_grid_sentinel ? nothing : v) : nothing
+    nom_ky_min = read_nominal_bound(bridge, "nominal_ky_min")
+    nom_ky_max = read_nominal_bound(bridge, "nominal_ky_max")
+    nom_kz_min = read_nominal_bound(bridge, "nominal_kz_min")
+    nom_kz_max = read_nominal_bound(bridge, "nominal_kz_max")
+    kdata, profileOrder = build_kdatapreprocessed_from_bridge(acc_imag_data, ky, kz, echo, dyn, chan, extr1_selected, num_kx;
+        nominal_ky_min=nom_ky_min, nominal_ky_max=nom_ky_max, nominal_kz_min=nom_kz_min, nominal_kz_max=nom_kz_max)
     labels = Dict{Symbol, Any}()  # Empty for preprocessed, we embed info in the 7D array structure
 else
     profileOrder = nothing
@@ -565,9 +702,63 @@ end
 
 recon = build_recon_parameters_base(scan)
 
-# Skip prewhitening in bridge recon unless a valid Psi is explicitly provided.
-if haskey(scan, :Psi)
+# Marks CASPR shot/TFE-indexed kdata (axes 2/3 are temporal tfe/shot, not
+# spatial ky/kz) so recon_mrtools.jl's refresh_recon_state! knows NOT to
+# recompute sensMaps via a spatial iFFT over those axes (see TODO.md
+# "THIRD latent bug found before GPU submission").
+recon[:casprSubspaceIndexed] = use_presort_caspr
+println("[BUILD] casprSubspaceIndexed = " * string(recon[:casprSubspaceIndexed]))
+
+# Noise pre-whitening: use this scan's own noise covariance if the bridge NPZ
+# provides one (see experiment/TODO.md 2026-09-14 "noise pre-whitening"); a
+# stale/mismatched Psi from a template must never be silently reused, since
+# noisePreWhitening! requires Psi to match this build's own channel count.
+if haskey(bridge, "noise_covariance") && length(bridge["noise_covariance"]) > 0
+    psi = ComplexF32.(bridge["noise_covariance"])
+    expected_num_chan = Int(maximum(chan)) + 1
+    if size(psi, 1) == size(psi, 2) == expected_num_chan
+        scan[:Psi] = psi
+        println("[BUILD] Psi (noise covariance) set: size=" * string(size(psi)))
+    else
+        @warn "noise_covariance shape $(size(psi)) does not match numChan=$expected_num_chan; skipping Psi."
+        delete!(scan, :Psi)
+    end
+elseif haskey(scan, :Psi)
     delete!(scan, :Psi)
+end
+
+# Bipolar echo-misalignment correction: fit the phase-ramp model from this
+# scan's own calibration lines (see experiment/TODO.md 2026-09-14 "bipolar
+# phase correction"). phaseCorrDataBipolar! only works on KdataRaw, but our
+# --presort/--presort-caspr paths build KdataPreprocessed directly, so we
+# build a minimal throwaway KdataRaw just to run the fit, then carry the
+# fitted params (not the raw calibration data itself) into the real recon.
+if haskey(bridge, "phase_corr_data") && size(bridge["phase_corr_data"], 2) > 0
+    pcd = ComplexF32.(bridge["phase_corr_data"])
+    pcd_echo = as_vector_int32(bridge["phase_corr_echo"])
+    pcd_sign = as_vector_int8(bridge["phase_corr_sign"])
+    ncalib = size(pcd, 2)
+    calib_labels = Dict{Symbol,Any}(
+        :echo => UInt16.(pcd_echo),
+        :sign => pcd_sign,
+        :LabelLookupTable => Any[reshape(collect(1:ncalib), 1, :), reshape(Float64[], 1, 0),
+                                  reshape(collect(1:ncalib), 1, :), reshape(Float64[], 1, 0), reshape(Float64[], 1, 0)],
+    )
+    calib_data = ReconBMRR.KdataRaw(
+        pcd, zeros(ComplexF32, size(pcd, 1), 0), pcd, zeros(ComplexF32, size(pcd, 1), 0),
+        zeros(ComplexF32, size(pcd, 1), 0), calib_labels,
+    )
+    calib_r = ReconBMRR.ReconParams(
+        "phase_corr_calib", ".", Dict{Symbol,Any}(), Dict{Symbol,Any}(), calib_data,
+        ReconBMRR.Cartesian3D(zeros(Int, 2, 1, 1, 1, 1, 1), :Cartesian3D), Symbol[], nothing,
+    )
+    try
+        ReconBMRR.phaseCorrDataBipolar!(calib_r)
+        recon[:phaseCorrDataBipolar] = calib_r.reconParameters[:phaseCorrDataBipolar]
+        println("[BUILD] phaseCorrDataBipolar fit: " * string(recon[:phaseCorrDataBipolar]))
+    catch err
+        @warn "Bipolar phase-correction fit failed; proceeding without it." exception=err
+    end
 end
 
 # For preprocessed data, we have pre-built trajectory; otherwise create minimal
@@ -593,6 +784,20 @@ r = ReconBMRR.ReconParams(
 
 if has_template
     r.reconParameters = deep_merge(recon, r_template.reconParameters)
+    # deep_merge lets the template's own reconParameters override ours, but
+    # casprSubspaceIndexed must always reflect THIS build's own kdata layout,
+    # never a template's (e.g. a grid-indexed self-calibration template would
+    # otherwise clobber it back to false and silently re-trigger the spatial
+    # sensMaps recompute in recon_mrtools.jl's refresh_recon_state!).
+    r.reconParameters[:casprSubspaceIndexed] = use_presort_caspr
+    # Same reasoning for phaseCorrDataBipolar: it's a fit computed fresh from
+    # THIS scan's own calibration lines and must never be silently clobbered
+    # or inherited from an unrelated template.
+    if haskey(recon, :phaseCorrDataBipolar)
+        r.reconParameters[:phaseCorrDataBipolar] = recon[:phaseCorrDataBipolar]
+    elseif haskey(r.reconParameters, :phaseCorrDataBipolar)
+        delete!(r.reconParameters, :phaseCorrDataBipolar)
+    end
     if !use_presort
         r.data.labels = deep_merge(r_template.data.labels, r.data.labels)
     end

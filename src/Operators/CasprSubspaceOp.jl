@@ -1,5 +1,7 @@
 export CuCasprSubspaceOp
 
+const _SUBSPACEOP_SYNC = Ref{Bool}(get(ENV, "RECON_SUBSPACEOP_SYNC", "0") == "1")
+
 function cuprod_caspr_subspace!(y, x, profiles, basis, reconSize, numContr, numChan, numTFE, numShots, numBasis, numEchoes, weights)
     threads_per_block = 6
     threads_per_blockTFE = minimum([threads_per_block, numTFE])
@@ -37,7 +39,14 @@ function cuprod_caspr_subspace!(y, x, profiles, basis, reconSize, numContr, numC
         end
     end
 
+    if _SUBSPACEOP_SYNC[]
+        println(stdout, "[SUBSPACEOP] prod: launching prod_kernel! blocks=$blocks_per_grid threads=$threads_per_block reconSize=$reconSize numTFE=$numTFE numShots=$numShots numEchoes=$numEchoes numBasis=$numBasis numChan=$numChan numContr=$numContr size(x)=$(size(x)) size(y)=$(size(y)) size(profiles)=$(size(profiles)) profiles_x_range=$(extrema(Array(profiles[1,:,:,:,:]))) profiles_y_range=$(extrema(Array(profiles[2,:,:,:,:])))"); flush(stdout)
+    end
     @cuda blocks=blocks_per_grid threads=threads_per_block prod_kernel!(profiles, x, y, numTFE, numShots, reconSize[1], basis, weights)
+    if _SUBSPACEOP_SYNC[]
+        CUDA.synchronize()
+        println(stdout, "[SUBSPACEOP] prod: kernel finished OK"); flush(stdout)
+    end
 end
 
 function cuctprod_caspr_subspace!(y, x, profiles, basis, reconSize, numContr, numChan, numTFE, numShots, numBasis, numEchoes, weights)
@@ -78,7 +87,21 @@ function cuctprod_caspr_subspace!(y, x, profiles, basis, reconSize, numContr, nu
         end
     end
 
+    if _SUBSPACEOP_SYNC[]
+        px_range = extrema(Array(profiles[1,:,:,:,:]))
+        py_range = extrema(Array(profiles[2,:,:,:,:]))
+        println(stdout, "[SUBSPACEOP] ctprod: launching prod_kernel! blocks=$blocks_per_grid threads=$threads_per_block reconSize=$reconSize numTFE=$numTFE numShots=$numShots numEchoes=$numEchoes numBasis=$numBasis numChan=$numChan numContr=$numContr size(x)=$(size(x)) size(y)=$(size(y)) profile_x_range=$px_range (bound=reconSize[2]=$(reconSize[2])) profile_y_range=$py_range (bound=reconSize[3]=$(reconSize[3]))")
+        flush(stdout)
+        if px_range[2] > reconSize[2] || py_range[2] > reconSize[3]
+            println(stdout, "[SUBSPACEOP] ctprod: *** OUT-OF-BOUNDS profile index detected before kernel launch *** px_max=$(px_range[2]) > reconSize[2]=$(reconSize[2]) ? $(px_range[2] > reconSize[2])   py_max=$(py_range[2]) > reconSize[3]=$(reconSize[3]) ? $(py_range[2] > reconSize[3])")
+            flush(stdout)
+        end
+    end
     @cuda blocks=blocks_per_grid threads=threads_per_block prod_kernel!(profiles, x, y, numChan, reconSize[1], numEchoes, basis, weights)
+    if _SUBSPACEOP_SYNC[]
+        CUDA.synchronize()
+        println(stdout, "[SUBSPACEOP] ctprod: kernel finished OK"); flush(stdout)
+    end
 end
 
 function CuCasprSubspaceOp(profiles, basis, reconSize, numContr, numChan, weights) 
@@ -94,5 +117,5 @@ function CuCasprSubspaceOp(profiles, basis, reconSize, numContr, numChan, weight
                        (res,x) -> cuprod_caspr_subspace!(res, x, profiles_gpu, basis_gpu, reconSize, numContr, numChan, numTFE, numShots, numBasis, numEchoes, weights_gpu),
                        nothing,
                        (res,x) -> cuctprod_caspr_subspace!(res, x, profiles_gpu, basis_gpu, reconSize, numContr, numChan, numTFE, numShots, numBasis, numEchoes, weights_gpu),
-                       S=CuVector{ComplexF32})
+                       S=concrete_cuvector_type(ComplexF32))
 end

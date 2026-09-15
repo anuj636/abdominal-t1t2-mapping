@@ -108,14 +108,51 @@ const DICT_PATH = resolve_dict_path()
 @info "Using dictionary path: $DICT_PATH"
 
 """
+Radial cosine taper over the (ky,kz) index plane: 1.0 within r_inner of center,
+0.0 beyond r_outer, smooth cosine transition between.
+"""
+function radial_calib_taper(ny::Int, nz::Int, r_inner::Float64, r_outer::Float64)
+    w = ones(Float64, ny, nz)
+    cy, cz = (ny - 1) / 2, (nz - 1) / 2
+    for j in 1:nz, i in 1:ny
+        r = sqrt((i - 1 - cy)^2 + (j - 1 - cz)^2)
+        if r <= r_inner
+            w[i, j] = 1.0
+        elseif r >= r_outer
+            w[i, j] = 0.0
+        else
+            w[i, j] = 0.5 * (1 + cos(pi * (r - r_inner) / (r_outer - r_inner)))
+        end
+    end
+    return w
+end
+
+"""
 Compute coil sensitivity maps from pre-sorted kdata using a sum-of-squares approach.
 kdata layout: (kx, ky, kz, echoes, dyn, chan, interleaves)
 Returns sensMaps of size (kx, ky, kz, chan).
+
+Restricts estimation to the reliably-sampled k-space calibration region (near-100%
+coverage at the center, falling off with radius for this variable-density CASPR
+trajectory -- confirmed empirically, see experiment/TODO.md 2026-09-14 root-cause
+entry). Without this, the raw SOS ratio is dominated by aliasing-driven speckle
+noise in the poorly-covered outer k-space shell, producing sensMaps that are pure
+noise in exactly the central image region where the true object sits (see
+experiment/sensmaps_perchannel.png) -- a broken coil-sensitivity input makes
+SENSE-style unfolding of the coherent aliasing impossible regardless of downstream
+regularization/dictionary constraints.
 """
 function compute_sensmaps_sos(kdata::Array{Complex{T}, 7}) where T<:AbstractFloat
     kx, ky, kz, necho, ndyn, nchan, ninter = size(kdata)
     # Average across echoes, dynamics, interleaves → (kx, ky, kz, chan)
     kdata_avg = dropdims(mean(kdata, dims=(4, 5, 7)), dims=(4, 5, 7))
+    # Calibration-region taper: full weight to r_inner, cosine taper to zero by r_outer.
+    # Empirically swept (experiment/sensmaps_taper_sweep*.png, TODO.md 2026-09-14):
+    # radii as large as (25,50) still show severe speckle (barely tapers anything);
+    # only a genuinely small calibration region -- (6,10), like standard GRAPPA/ESPIRiT
+    # calibration-line counts -- yields smooth, physically-plausible per-channel maps.
+    taper = Float32.(radial_calib_taper(ky, kz, 6.0, 10.0))
+    kdata_avg = kdata_avg .* reshape(taper, 1, ky, kz, 1)
     # Centered 3D iFFT to image space per coil (matches FFTOp shift convention)
     imgs = similar(kdata_avg)
     for c in 1:nchan
@@ -142,14 +179,31 @@ function refresh_recon_state!(r)
     r.reconParameters[:numKy] = size(kd, 2)
     r.reconParameters[:numKz] = size(kd, 3)
 
+    # CASPR shot/TFE-indexed kdata (see build_jld2_from_mrtools_bridge.jl
+    # --presort-caspr) has temporal (tfe,shot) axes, not spatial (ky,kz), on
+    # kdata dims 2/3. compute_sensmaps_sos assumes spatial axes and would
+    # silently corrupt sensMaps/reconSize via a bogus iFFT-over-time if run
+    # here. Skip the spatial-shape-mismatch recompute for this data and only
+    # sanity-check the channel count.
+    caspr_indexed = get(r.reconParameters, :casprSubspaceIndexed, false)
+
     if haskey(r.reconParameters, :sensMaps)
         sm = r.reconParameters[:sensMaps]
-        if size(sm)[1:3] != size(kd)[1:3] || size(sm, 4) != size(kd, 6)
+        if caspr_indexed
+            if size(sm, 4) != size(kd, 6)
+                error("sensMaps channel count $(size(sm,4)) does not match kdata channel count $(size(kd,6)) " *
+                      "for CASPR shot/TFE-indexed data. A template with matching channel-count sensMaps is required " *
+                      "(spatial sensMaps cannot be recomputed from temporally-indexed kdata).")
+            end
+        elseif size(sm)[1:3] != size(kd)[1:3] || size(sm, 4) != size(kd, 6)
             @warn "sensMaps $(size(sm)) do not match kdata (spatial=$(size(kd)[1:3]), chan=$(size(kd,6))). " *
                   "Recomputing sensMaps from kdata using sum-of-squares method."
             r.reconParameters[:sensMaps] = compute_sensmaps_sos(kd)
             @info "New sensMaps size: $(size(r.reconParameters[:sensMaps]))"
         end
+    elseif caspr_indexed
+        error("No sensMaps in JLD2 for CASPR shot/TFE-indexed data, and sensMaps cannot be computed from " *
+              "temporally-indexed kdata via compute_sensmaps_sos. Provide a template JLD2 with valid sensMaps.")
     else
         @info "No sensMaps in JLD2. Computing from kdata using sum-of-squares method."
         r.reconParameters[:sensMaps] = compute_sensmaps_sos(kd)
@@ -169,7 +223,15 @@ function apply_channel_limit!(r, requested::Integer; reason::AbstractString="")
     @warn "Reducing channel count for lower-memory reconstruction" reason=reason requested=requested selected=target available=available
     r.data.kdata = r.data.kdata[:, :, :, :, :, 1:target, :]
     if haskey(r.reconParameters, :sensMaps)
-        delete!(r.reconParameters, :sensMaps)
+        if get(r.reconParameters, :casprSubspaceIndexed, false)
+            # sensMaps cannot be recomputed for CASPR-indexed data (see
+            # refresh_recon_state!), so subset its channel axis to match
+            # kdata's reduced channel count instead of deleting it.
+            sm = r.reconParameters[:sensMaps]
+            r.reconParameters[:sensMaps] = sm[:, :, :, 1:target]
+        else
+            delete!(r.reconParameters, :sensMaps)
+        end
     end
     if haskey(r.reconParameters, :sdcCartesian)
         delete!(r.reconParameters, :sdcCartesian)
@@ -289,12 +351,15 @@ else
     r2 = sortData(r)
     log_label_summary(r2, "after sortData")
     log_recon_dims(r2, "after sortData")
-    
-    if has_phase_corr
-        applyPhaseCorrDataBipolar!(r2)
-    else
-        @info "Skipping applyPhaseCorrDataBipolar!: no phase correction fit was computed"
-    end
+end
+
+# Applies the bipolar phase-correction fit (whether computed by the legacy
+# phaseCorrDataBipolar!(r) path above, or precomputed by the bridge builder
+# for the --presort/--presort-caspr path) to r2's KdataPreprocessed data.
+if haskey(r2.reconParameters, :phaseCorrDataBipolar)
+    applyPhaseCorrDataBipolar!(r2)
+else
+    @info "Skipping applyPhaseCorrDataBipolar!: no phase correction fit was computed"
 end
 
 if has_noise_cov
@@ -517,9 +582,18 @@ end
 # Perform reconstruction
 r3 = run_recon_with_fallback!(r2)
 
-# Apply mask using recomputed sensMaps
-senseMask = sum(abs.(r3.reconParameters[:sensMaps]), dims=4) .== 0.0
-senseMask = senseMask[:,:,:,1]
+# Apply mask using recomputed sensMaps. NOTE (2026-09-15): an exact `== 0.0`
+# check never triggers with real floating-point IFFT-derived sensMaps (confirmed
+# empirically: 0 of ~2M voxels are ever exactly zero) -- this was a silent no-op,
+# leaving background (no true signal) regions to show raw reconstruction noise
+# instead of being zeroed. Use a relative-magnitude threshold instead.
+sense_mask_threshold = try
+    parse(Float64, get(ENV, "RECON_SENSE_MASK_THRESHOLD", "0.05"))
+catch
+    0.05
+end
+sensMagSum = sum(abs.(r3.reconParameters[:sensMaps]), dims=4)
+senseMask = sensMagSum[:,:,:,1] .< (sense_mask_threshold * maximum(sensMagSum))
 for s = eachslice(r3.imgData.signal, dims=(4, 5, 6, 7))
     @show size(s)
     s[senseMask] .= 0.0
