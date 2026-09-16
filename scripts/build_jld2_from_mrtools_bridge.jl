@@ -532,6 +532,66 @@ function get_encoding_size(scan::Dict{Symbol,Any}, bridge::AbstractDict{String,<
     return Int32.(fallback)
 end
 
+function get_nominal_bound(bridge::AbstractDict{String,<:Any}, key::String)
+    sentinel = -1000000
+    if !haskey(bridge, key)
+        return nothing
+    end
+    v = Int(only(bridge[key]))
+    return v == sentinel ? nothing : v
+end
+
+"""
+    derive_acq_voxel_and_fov(bridge, num_kx, ky_min, ky_max, kz_min, kz_max, reconstructed_encoding_size)
+
+Derive the TRUE physical `AcqVoxelSize`/`RecVoxelSize`/`FOV` from the .sin
+header's `oversample_factors`, `voxel_sizes` and `scanner_recon_resolutions`
+(exported by `export_reconbmrr_bridge.py`), independent of whatever
+`encodingSize` this builder uses for the actual reconstruction grid.
+
+Validated against `phantom_3_5mm.jld2`'s known-correct values: nominal
+encoding = [100,75,101], AcqVoxelSize=[3.5,3.5,3.5]mm, RecVoxelSize=
+[2.7344,2.7344,3.5]mm, FOV=[350,262.5,353.5]mm (see TODO.md "bridge data
+fidelity: FOV/voxel-size" entry for the full derivation). Without this,
+AcqVoxelSize/RecVoxelSize/FOV fall back to placeholder [1,1,1] (or [0,0,0])
+values, so the final NIfTI's physical grid/voxel scale silently mismatches
+the true acquisition -- previously observed as the reconstructed grid
+(139,73,200) never matching the reference's (141,105,140).
+"""
+function derive_acq_voxel_and_fov(bridge::AbstractDict{String,<:Any}, num_kx::Int,
+        ky_min::Int32, ky_max::Int32, kz_min::Int32, kz_max::Int32,
+        reconstructed_encoding_size::Vector{Int32})
+    if !haskey(bridge, "oversample_factors") || !haskey(bridge, "voxel_sizes") || !haskey(bridge, "scanner_recon_resolutions")
+        return nothing, nothing, nothing
+    end
+    oversample = Float32.(vec(bridge["oversample_factors"]))
+    rec_voxel = Float32.(vec(bridge["voxel_sizes"]))
+    scanner_res = Float32.(vec(bridge["scanner_recon_resolutions"]))
+    if length(oversample) < 3 || length(rec_voxel) < 3 || length(scanner_res) < 3 || any(rec_voxel .<= 0f0) || any(oversample[1:3] .<= 0f0)
+        return nothing, nothing, nothing
+    end
+
+    # Prefer the TRUE nominal ky/kz encoding-matrix bounds (from the .sin
+    # header's min/max_encoding_numbers) over this scan's acquired/observed
+    # extent -- an accelerated trajectory not sampling the outermost shell
+    # must not shrink the physical voxel-size/FOV derivation.
+    nom_ky_min = get_nominal_bound(bridge, "nominal_ky_min")
+    nom_ky_max = get_nominal_bound(bridge, "nominal_ky_max")
+    nom_kz_min = get_nominal_bound(bridge, "nominal_kz_min")
+    nom_kz_max = get_nominal_bound(bridge, "nominal_kz_max")
+    nominal_ky_count = (nom_ky_min !== nothing && nom_ky_max !== nothing) ? (nom_ky_max - nom_ky_min + 1) : Int(ky_max - ky_min + 1)
+    nominal_kz_count = (nom_kz_min !== nothing && nom_kz_max !== nothing) ? (nom_kz_max - nom_kz_min + 1) : Int(kz_max - kz_min + 1)
+
+    nominal_encoding_size = Float32[num_kx, nominal_ky_count, nominal_kz_count] ./ oversample[1:3]
+    if any(nominal_encoding_size .<= 0f0)
+        return nothing, nothing, nothing
+    end
+
+    acq_voxel = rec_voxel[1:3] .* (scanner_res[1:3] ./ nominal_encoding_size)
+    fov = acq_voxel .* Float32.(reconstructed_encoding_size)
+    return acq_voxel, rec_voxel[1:3], fov
+end
+
 bridge_npz, template_jld2, out_jld2, use_presort, use_presort_caspr = parse_args(ARGS)
 bridge = NPZ.npzread(bridge_npz)
 has_template = !isnothing(template_jld2)
@@ -674,13 +734,24 @@ scan[:encodingSize] = get_encoding_size(
 )
 scan[:AcqMode] = "Cartesian"
 
-scan[:AcqVoxelSize] = normalize_vec3(get(scan, :AcqVoxelSize, Float32[]), 1.0f0)
-scan[:RecVoxelSize] = normalize_vec3(get(scan, :RecVoxelSize, Float32[]), 1.0f0)
-fov = normalize_vec3(get(scan, :FOV, Float32[]), 0.0f0)
-expected_encoding = Int32.(round.(Int, fov ./ scan[:RecVoxelSize]))
-if any(fov .<= 0.0f0) || any(abs.(expected_encoding .- scan[:encodingSize]) .> 1)
-    # Keep FOV and encodingSize consistent to prevent oversampling crop to 1x1x1.
-    fov = Float32.(scan[:encodingSize]) .* scan[:RecVoxelSize]
+acq_voxel_derived, rec_voxel_derived, fov_derived = derive_acq_voxel_and_fov(
+    bridge, num_kx, ky_min, ky_max, kz_min, kz_max, scan[:encodingSize])
+
+scan[:AcqVoxelSize] = acq_voxel_derived !== nothing ? acq_voxel_derived : normalize_vec3(get(scan, :AcqVoxelSize, Float32[]), 1.0f0)
+scan[:RecVoxelSize] = rec_voxel_derived !== nothing ? rec_voxel_derived : normalize_vec3(get(scan, :RecVoxelSize, Float32[]), 1.0f0)
+if fov_derived !== nothing
+    # Trust the .sin-derived FOV (see derive_acq_voxel_and_fov docstring) --
+    # it is NOT expected to satisfy fov/RecVoxelSize == encodingSize, since
+    # RecVoxelSize reflects the scanner's own further-interpolated output
+    # resolution, not the raw reconstruction grid this pipeline builds on.
+    fov = fov_derived
+else
+    fov = normalize_vec3(get(scan, :FOV, Float32[]), 0.0f0)
+    expected_encoding = Int32.(round.(Int, fov ./ scan[:RecVoxelSize]))
+    if any(fov .<= 0.0f0) || any(abs.(expected_encoding .- scan[:encodingSize]) .> 1)
+        # Keep FOV and encodingSize consistent to prevent oversampling crop to 1x1x1.
+        fov = Float32.(scan[:encodingSize]) .* scan[:RecVoxelSize]
+    end
 end
 scan[:FOV] = fov
 
