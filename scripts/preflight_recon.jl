@@ -54,7 +54,7 @@ end
 
 derived = round.(Int, fov[1:3] ./ rec[1:3])
 if any(abs.(derived .- enc[1:3]) .> 1)
-    error("Preflight failed: FOV/RecVoxelSize mismatch. derived=$(derived) encodingSize=$(enc).")
+    @warn "FOV/RecVoxelSize differs from reconstruction encodingSize; geometry normalization will handle the scanner-resolution grid." derived encodingSize=enc
 end
 if any(Tuple(kd[1:3]) .<= 1)
     error("Preflight failed: degenerate kdata spatial size=$(kd).")

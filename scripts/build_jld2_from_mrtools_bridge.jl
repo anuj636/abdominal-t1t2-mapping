@@ -134,9 +134,12 @@ function build_kdatapreprocessed_from_bridge(
         # Place profile at (ky_idx, kz_idx) for all other dimensions
         kdata[:, ky_idx, kz_idx, echo_idx, dyn_idx, chan_idx, inter_idx] .= acc_imag_data[:, i]
         
-        # Record profile coordinates (convert back to original ky/kz values for reference)
-        profileOrder[1, ky_idx, kz_idx, echo_idx, dyn_idx, inter_idx] = ky[i]
-        profileOrder[2, ky_idx, kz_idx, echo_idx, dyn_idx, inter_idx] = kz[i]
+        # Record 1-based array-offset indices (matching sortData()'s native
+        # convention), not the raw signed ky/kz values -- CuCasprSubspaceOp's
+        # GPU kernels index directly into arrays with these values, so signed
+        # values (e.g. -36) trigger an out-of-bounds device-side error.
+        profileOrder[1, ky_idx, kz_idx, echo_idx, dyn_idx, inter_idx] = ky_idx
+        profileOrder[2, ky_idx, kz_idx, echo_idx, dyn_idx, inter_idx] = kz_idx
     end
     
     return ReconBMRR.KdataPreprocessed(kdata), profileOrder
@@ -151,7 +154,11 @@ function build_kdatapreprocessed_caspr_subspace_from_bridge(
     shot_repeat::Vector,
     contr::Vector,
     chan::Vector,
-    num_kx::Int,
+    num_kx::Int;
+    nominal_ky_min::Union{Int,Nothing}=nothing,
+    nominal_ky_max::Union{Int,Nothing}=nothing,
+    nominal_kz_min::Union{Int,Nothing}=nothing,
+    nominal_kz_max::Union{Int,Nothing}=nothing,
 )
     """
     Build KdataPreprocessed indexed by CASPR shot/TFE structure instead of a
@@ -164,6 +171,16 @@ function build_kdatapreprocessed_caspr_subspace_from_bridge(
     See TODO.md "Track B" sections for the empirical derivation of
     tfe_slot/shot_repeat from raw seq_nr, and Preprocessing.jl's
     subspaceBasis! for the confirmed dictionary flatten order.
+
+    CuCasprSubspaceOp's CUDA kernels use profileOrder[1/2, ...] directly as
+    1-based Julia array indices into the reconSize-shaped spatial (ky,kz)
+    grid (see cuprod_caspr_subspace!/cuctprod_caspr_subspace! in
+    CasprSubspaceOp.jl: `x[kx_id,profile_x,profile_y,...]`), and rely on the
+    zeros()-initialized default value 0 as the "not filled" sentinel (guard
+    `profile_x > 0 && profile_y > 0`). So profileOrder must store 1-based
+    offset indices (ky - ky_min + 1), NOT raw signed ky/kz values -- storing
+    raw values both misindexes the spatial grid and breaks the zero-sentinel
+    guard (a legitimate ky=0/kz=0 sample would be wrongly treated as unfilled).
 
     Returns tuple: (kdata_obj, trajectory)
     """
@@ -180,6 +197,11 @@ function build_kdatapreprocessed_caspr_subspace_from_bridge(
         @warn("Skipping $n_invalid/$n profile(s) with unresolved tfe_slot/shot_repeat")
     end
 
+    ky_min = nominal_ky_min !== nothing ? nominal_ky_min : minimum(ky[valid])
+    ky_max = nominal_ky_max !== nothing ? nominal_ky_max : maximum(ky[valid])
+    kz_min = nominal_kz_min !== nothing ? nominal_kz_min : minimum(kz[valid])
+    kz_max = nominal_kz_max !== nothing ? nominal_kz_max : maximum(kz[valid])
+
     num_tfe = maximum(tfe_slot[valid]) + 1
     num_shots = maximum(shot_repeat[valid]) + 1
     num_echoes = maximum(echo) + 1
@@ -190,17 +212,10 @@ function build_kdatapreprocessed_caspr_subspace_from_bridge(
     kdata = zeros(ComplexF32, num_kx, num_tfe, num_shots, num_echoes, num_contr, num_chan, 1)
 
     # Initialize trajectory: (2, tfe, shots, echoes, contr, interleaves=1)
-    # profileOrder[1, :] = ky indices, profileOrder[2, :] = kz indices.
-    # Default (unfilled) slots point at the first valid profile's (ky,kz);
-    # since the matching kdata entry stays exactly zero, downstream
-    # weighting (weightsMasked from dataTemp .== 0) excludes them from the
-    # forward/adjoint operator regardless of this placeholder trajectory.
+    # profileOrder[1, :] = 1-based ky offset index, profileOrder[2, :] = 1-based
+    # kz offset index. Unfilled slots stay at the zeros() default (0), which
+    # the CUDA kernel's guard treats as "no sample here".
     profileOrder = zeros(Int, 2, num_tfe, num_shots, num_echoes, num_contr, 1)
-    first_valid = findfirst(valid)
-    if first_valid !== nothing
-        profileOrder[1, :, :, :, :, :] .= ky[first_valid]
-        profileOrder[2, :, :, :, :, :] .= kz[first_valid]
-    end
 
     for i = 1:n
         if !valid[i]
@@ -211,13 +226,16 @@ function build_kdatapreprocessed_caspr_subspace_from_bridge(
         echo_idx = echo[i] + 1
         contr_idx = contr[i] + 1
         chan_idx = chan[i] + 1
+        ky_idx = ky[i] - ky_min + 1
+        kz_idx = kz[i] - kz_min + 1
 
         kdata[:, tfe_idx, shot_idx, echo_idx, contr_idx, chan_idx, 1] .= acc_imag_data[:, i]
-        profileOrder[1, tfe_idx, shot_idx, echo_idx, contr_idx, 1] = ky[i]
-        profileOrder[2, tfe_idx, shot_idx, echo_idx, contr_idx, 1] = kz[i]
+        profileOrder[1, tfe_idx, shot_idx, echo_idx, contr_idx, 1] = ky_idx
+        profileOrder[2, tfe_idx, shot_idx, echo_idx, contr_idx, 1] = kz_idx
     end
 
-    println("[BUILD-CASPR] numTFE=$num_tfe numShots=$num_shots numEchoes=$num_echoes numContr=$num_contr numChan=$num_chan")
+    println("[BUILD-CASPR] numTFE=$num_tfe numShots=$num_shots numEchoes=$num_echoes numContr=$num_contr numChan=$num_chan " *
+            "ky_range=($ky_min,$ky_max) kz_range=($kz_min,$kz_max)")
 
     return ReconBMRR.KdataPreprocessed(kdata), profileOrder
 end
@@ -649,27 +667,29 @@ end
 
 scan = build_scan_parameters_base()
 
+# Use the nominal (sequence-designed) ky/kz encoding matrix bounds from the
+# .sin header when available, rather than shrinking the grid to only this
+# scan's acquired extent (see TODO.md 2026-09-14 "200x75x141 k-space
+# dimensions" reviewer finding). NOTE: the bridge exports a 1-element
+# sentinel value (-1000000), NOT a 0-length array, to signal "absent" -- a
+# 0-length 1D int32 array positioned after the multi-GB accImagData entry
+# triggers a reproducible EOFError in Julia's NPZ.jl/ZipFile.jl (see TODO.md
+# 2026-09-14 "NPZ.jl zero-length array" entry).
+nominal_grid_sentinel = -1000000
+read_nominal_bound(bridge, key) = haskey(bridge, key) ? (v = Int(only(bridge[key])); v == nominal_grid_sentinel ? nothing : v) : nothing
+nom_ky_min = read_nominal_bound(bridge, "nominal_ky_min")
+nom_ky_max = read_nominal_bound(bridge, "nominal_ky_max")
+nom_kz_min = read_nominal_bound(bridge, "nominal_kz_min")
+nom_kz_max = read_nominal_bound(bridge, "nominal_kz_max")
+
 # Build data object based on presort flag
 if use_presort_caspr
     println("[BUILD] Using CASPR shot/TFE-indexed KdataPreprocessed path (skips sortData, targets CuCasprSubspaceOp)")
-    kdata, profileOrder = build_kdatapreprocessed_caspr_subspace_from_bridge(acc_imag_data, ky, kz, echo, tfe_slot, shot_repeat, contr, chan, num_kx)
+    kdata, profileOrder = build_kdatapreprocessed_caspr_subspace_from_bridge(acc_imag_data, ky, kz, echo, tfe_slot, shot_repeat, contr, chan, num_kx;
+        nominal_ky_min=nom_ky_min, nominal_ky_max=nom_ky_max, nominal_kz_min=nom_kz_min, nominal_kz_max=nom_kz_max)
     labels = Dict{Symbol, Any}()  # Empty for preprocessed, we embed info in the 7D array structure
 elseif use_presort
     println("[BUILD] Using pre-sorted KdataPreprocessed path (skips sortData)")
-    # Use the nominal (sequence-designed) ky/kz encoding matrix bounds from
-    # the .sin header when available, rather than shrinking the grid to only
-    # this scan's acquired extent (see TODO.md 2026-09-14 "200x75x141
-    # k-space dimensions" reviewer finding). NOTE: the bridge exports a
-    # 1-element sentinel value (-1000000), NOT a 0-length array, to signal
-    # "absent" -- a 0-length 1D int32 array positioned after the multi-GB
-    # accImagData entry triggers a reproducible EOFError in Julia's
-    # NPZ.jl/ZipFile.jl (see TODO.md 2026-09-14 "NPZ.jl zero-length array" entry).
-    nominal_grid_sentinel = -1000000
-    read_nominal_bound(bridge, key) = haskey(bridge, key) ? (v = Int(only(bridge[key])); v == nominal_grid_sentinel ? nothing : v) : nothing
-    nom_ky_min = read_nominal_bound(bridge, "nominal_ky_min")
-    nom_ky_max = read_nominal_bound(bridge, "nominal_ky_max")
-    nom_kz_min = read_nominal_bound(bridge, "nominal_kz_min")
-    nom_kz_max = read_nominal_bound(bridge, "nominal_kz_max")
     kdata, profileOrder = build_kdatapreprocessed_from_bridge(acc_imag_data, ky, kz, echo, dyn, chan, extr1_selected, num_kx;
         nominal_ky_min=nom_ky_min, nominal_ky_max=nom_ky_max, nominal_kz_min=nom_kz_min, nominal_kz_max=nom_kz_max)
     labels = Dict{Symbol, Any}()  # Empty for preprocessed, we embed info in the 7D array structure
@@ -717,6 +737,18 @@ if has_template
     scan = deep_merge(scan, r_template.scanParameters)
 end
 
+if haskey(bridge, "oversample_factors")
+    oversample_factors = Float32.(vec(bridge["oversample_factors"]))
+    if length(oversample_factors) >= 3 && all(isfinite.(oversample_factors[1:3])) && all(oversample_factors[1:3] .> 0f0)
+        scan[:KxOversampling] = fill(oversample_factors[1], 2)
+        scan[:KyOversampling] = fill(oversample_factors[2], 2)
+        scan[:KzOversampling] = fill(oversample_factors[3], 2)
+        println("[BUILD] Oversampling factors stored: Kx=$(scan[:KxOversampling]) Ky=$(scan[:KyOversampling]) Kz=$(scan[:KzOversampling])")
+    else
+        @warn "Ignoring invalid oversample_factors metadata" oversample_factors
+    end
+end
+
 ky_min = Int32(get_scalar(bridge, "ky_min", minimum(ky)))
 ky_max = Int32(get_scalar(bridge, "ky_max", maximum(ky)))
 kz_min = Int32(get_scalar(bridge, "kz_min", minimum(kz)))
@@ -736,6 +768,12 @@ scan[:AcqMode] = "Cartesian"
 
 acq_voxel_derived, rec_voxel_derived, fov_derived = derive_acq_voxel_and_fov(
     bridge, num_kx, ky_min, ky_max, kz_min, kz_max, scan[:encodingSize])
+
+if acq_voxel_derived === nothing || rec_voxel_derived === nothing || fov_derived === nothing
+    geometry_status = [(key, haskey(bridge, key) ? "present" : "missing") for key in ("oversample_factors", "voxel_sizes", "scanner_recon_resolutions")]
+    error("Bridge NPZ is missing valid geometry metadata; fields=$(geometry_status). " *
+          "Regenerate the bridge NPZ with geometry metadata before building JLD2.")
+end
 
 scan[:AcqVoxelSize] = acq_voxel_derived !== nothing ? acq_voxel_derived : normalize_vec3(get(scan, :AcqVoxelSize, Float32[]), 1.0f0)
 scan[:RecVoxelSize] = rec_voxel_derived !== nothing ? rec_voxel_derived : normalize_vec3(get(scan, :RecVoxelSize, Float32[]), 1.0f0)

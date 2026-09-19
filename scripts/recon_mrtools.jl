@@ -46,15 +46,28 @@ function init_cuda_available()
         return false
     end
 
-    try
-        @eval using CUDA
-        CUDA.device!(0) # Set the GPU device to use when explicitly requested
-        @info "CUDA initialized for reconstruction" device=CUDA.name(CUDA.device())
-        return true
-    catch err
-        @warn "CUDA initialization failed; continuing in CPU-only mode" exception=(err, catch_backtrace())
-        return false
+    # CUDA_ERROR_NOT_INITIALIZED right after a GPU is released by a prior job
+    # on the same node is transient (driver re-init race), not a permanent
+    # unavailability -- retry briefly before falling back to CPU, since this
+    # codebase's subspace/CASPR reconstruction path has no CPU implementation
+    # and will hard-fail later if CUDA_AVAILABLE ends up false.
+    max_attempts = 5
+    for attempt in 1:max_attempts
+        try
+            @eval using CUDA
+            CUDA.device!(0) # Set the GPU device to use when explicitly requested
+            @info "CUDA initialized for reconstruction" device=CUDA.name(CUDA.device()) attempt=attempt
+            return true
+        catch err
+            if attempt == max_attempts
+                @warn "CUDA initialization failed after $(max_attempts) attempts; continuing in CPU-only mode" exception=(err, catch_backtrace())
+                return false
+            end
+            @warn "CUDA initialization attempt $(attempt)/$(max_attempts) failed; retrying" exception=(err, catch_backtrace())
+            sleep(5)
+        end
     end
+    return false
 end
 
 const CUDA_AVAILABLE = init_cuda_available()
@@ -399,6 +412,15 @@ if FORCE_CPU_SOLVER
     r2.reconParameters[:cudaSolver] = false
 end
 
+# constructOperators() has no CPU implementation for subspaceRecon (asserts
+# reconParameters[:cuda] && cudaSolver); fail fast with a clear message here
+# instead of a deep AssertionError inside Reconstruction.jl.
+if r2.reconParameters[:iterativeReconParams][:subspaceRecon] && !(r2.reconParameters[:cuda] && r2.reconParameters[:cudaSolver])
+    error("Subspace/CASPR reconstruction requires a working CUDA device, but CUDA_AVAILABLE=$(CUDA_AVAILABLE) " *
+          "(cuda=$(r2.reconParameters[:cuda]), cudaSolver=$(r2.reconParameters[:cudaSolver])). " *
+          "Resubmit on a node with a functional GPU; there is no CPU fallback for this path.")
+end
+
 @info "Reconstruction backend configuration" requested_cuda=RECON_USE_CUDA cuda=CUDA_AVAILABLE cudaSolver=r2.reconParameters[:cudaSolver] admm_iterations=r2.reconParameters[:iterativeReconParams][:iterations] cg_iterations=r2.reconParameters[:iterativeReconParams][:iterationsCG]
 println("[BACKEND] cuda=$(r2.reconParameters[:cuda]) cudaSolver=$(r2.reconParameters[:cudaSolver])")
 
@@ -477,6 +499,41 @@ if motionCorrection
 end
 
 apply_channel_limit!(r2, REQUESTED_MAX_CHANNELS; reason="preconfigured low-memory mode")
+
+# Readout (kx) oversampling is normally cropped from the image AFTER
+# reconstruction (upsampleRecVoxelSize!/removeOversampling! below), which
+# means the full oversampled kx grid dominates GPU memory during
+# constructOperators()/ADMM. Since KxOversampling exactly explains
+# kx=200 -> nominal encodingSize[1]=100 here, crop it from k-space instead
+# (ifft -> center-crop -> fft along kx), before building the reconstruction
+# operators. This is the same physical crop, just done earlier, and is safe
+# because the readout oversampling factor guarantees no aliasing in the
+# cropped region.
+const RECON_REDUCE_KX_OVERSAMPLING = get(ENV, "RECON_REDUCE_KX_OVERSAMPLING", "1") == "1"
+
+function remove_kx_readout_oversampling!(r)
+    target_kx = Int(r.scanParameters[:encodingSize][1])
+    kd = r.data.kdata
+    cur_kx = size(kd, 1)
+    if cur_kx <= target_kx
+        @info "No kx readout oversampling to remove" cur_kx target_kx
+        return
+    end
+    @info "Removing kx readout oversampling before reconstruction to reduce GPU memory" cur_kx target_kx
+    img = fftshift(ifft(ifftshift(kd, 1), 1), 1)
+    lo = div(cur_kx - target_kx, 2) + 1
+    hi = lo + target_kx - 1
+    img = img[lo:hi, :, :, :, :, :, :]
+    kd_new = ifftshift(fft(ifftshift(img, 1), 1), 1)
+    r.data.kdata = ComplexF32.(kd_new)
+    r.reconParameters[:numKx] = target_kx
+    @info "kx readout oversampling removed" new_kdata_size=size(r.data.kdata)
+end
+
+if RECON_REDUCE_KX_OVERSAMPLING
+    remove_kx_readout_oversampling!(r2)
+end
+
 subspaceBasis!(r2)
 refresh_recon_state!(r2)
 
@@ -518,6 +575,17 @@ function retry_on_cpu!(r; message::AbstractString, err=nothing)
         @warn message
     else
         @warn message exception=(err, catch_backtrace())
+    end
+    # Disabling subspaceRecon silently changes the exported signal's feature
+    # dimension from subspaceComponents to raw dynamics, which later fails
+    # (or worse, mismatches) in postprocessing's dictionary matching. There is
+    # no CPU implementation of the subspace/CASPR path, so a CPU fallback here
+    # is not a true equivalent retry -- fail loudly instead of producing an
+    # H5 with an incompatible feature axis.
+    if r.reconParameters[:iterativeReconParams][:subspaceRecon]
+        error("GPU reconstruction failed and CPU fallback would silently disable subspaceRecon, " *
+              "producing a signal with raw-dynamics feature dimension instead of subspaceComponents. " *
+              "Resubmit on a GPU with enough VRAM instead of falling back to CPU for this path.")
     end
     retry_r = deepcopy(r)
     apply_cpu_safe_solver!(retry_r)
