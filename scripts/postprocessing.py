@@ -36,7 +36,11 @@ def should_reduce_signal_features() -> bool:
 
 
 def should_align_reference_grid() -> bool:
-    return os.environ.get("POSTPROC_ALIGN_REFERENCE_GRID", "1") == "1"
+    # Default off: the stored reference/T1_ms.nii target shape was produced by a
+    # different dataset's ad-hoc RecVoxelSize=AcqVoxelSize-1.0 override (original_repo/
+    # scripts/recon.jl), not a general rule -- it doesn't apply to this bridge-NPZ
+    # pipeline's own correctly .sin-derived geometry. Opt in via env var if ever needed.
+    return os.environ.get("POSTPROC_ALIGN_REFERENCE_GRID", "0") == "1"
 
 
 def resize_nn_3d(arr: np.ndarray, target_shape):
